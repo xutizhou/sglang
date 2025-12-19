@@ -95,6 +95,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.shared_expert_balancer import SharedExpertBalancer
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -695,9 +696,26 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+
+        # Determine if shared expert balance is enabled
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        self._enable_shared_expert_balance = (
+            get_global_server_args().enable_shared_expert_balance
+            and self.moe_ep_size > 1
+            and not self._enable_a2a_moe
+            and self.num_fused_shared_experts == 0
+            and config.n_shared_experts is not None
+            and config.n_shared_experts > 0
+        )
+
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe, or with fp4 allgather
+            # disable tp for shared experts when enable deepep moe, or with fp4 allgather,
+            # or when shared expert balance is enabled (requires full copy on each rank)
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -707,9 +725,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_ascend_fuseep()
+                    if self._enable_a2a_moe
+                    or self._enable_shared_expert_balance
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -768,12 +785,24 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+
+        # Initialize SharedExpertBalancer for load balancing in EP + none mode
+        self.shared_expert_balancer = None
+        if self._enable_shared_expert_balance:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            # Check if waterfill mode is enabled (vs uniform mode)
+            balance_mode = get_global_server_args().shared_expert_balance_mode
+            use_waterfill = balance_mode == "waterfill"
+
+            self.shared_expert_balancer = SharedExpertBalancer(
+                num_experts=config.n_routed_experts,
+                world_size=self.moe_ep_size,
+                rank=get_tensor_model_parallel_rank(),
+                shared_scaling=1.0,
+                use_waterfill=use_waterfill,
+            )
 
     def get_moe_weights(self):
         return [
@@ -825,20 +854,49 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(
-            hidden_states, gemm_output_zero_allocator
-        )
 
+        # router_logits: (num_tokens, n_experts)
+        # We run routing on alt_stream to overlap with potential other work
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
-                final_hidden_states *= self.routed_scaling_factor
+
+        # If shared expert balance is enabled, we need topk_ids on CPU for assignment.
+        # This requires a synchronization point.
+        if (
+            self._enable_shared_expert_balance
+            and self.shared_expert_balancer is not None
+        ):
+            # Wait for topk_output to be ready
+            current_stream.wait_stream(self.alt_stream)
+
+            # Compute balanced shared expert output on current_stream
+            shared_output = self._forward_shared_experts_balanced(
+                hidden_states, topk_output.topk_ids, gemm_output_zero_allocator
+            )
+
+            # Compute routed experts on alt_stream
+            with torch.cuda.stream(self.alt_stream):
+                final_hidden_states = self.experts(hidden_states, topk_output)
+                if not _is_cuda or isinstance(
+                    self.experts.quant_method, KTEPWrapperMethod
+                ):
+                    final_hidden_states *= self.routed_scaling_factor
+        else:
+            # Original logic: shared on current_stream, routed on alt_stream
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
+            with torch.cuda.stream(self.alt_stream):
+                final_hidden_states = self.experts(hidden_states, topk_output)
+                if not _is_cuda or isinstance(
+                    self.experts.quant_method, KTEPWrapperMethod
+                ):
+                    final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        if shared_output is not None:
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -861,20 +919,35 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            if (
-                not self._fuse_shared_experts_inside_sbo
-            ):  # TODO: check if it supports mtp
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
+
+            # Shared expert computation with load balancing
+            if (
+                self._enable_shared_expert_balance
+                and self.shared_expert_balancer is not None
+            ):
+                # Use balancer to assign shared expert computation across ranks
+                shared_output = self._forward_shared_experts_balanced(
+                    hidden_states, topk_output.topk_ids, gemm_output_zero_allocator
+                )
+            elif not self._fuse_shared_experts_inside_sbo:
+                # Original: compute shared experts for all tokens
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
+            else:
+                shared_output = None
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if self._fuse_shared_experts_inside_sbo:
+        # SBO is incompatible with shared expert balance - skip SBO when balance is enabled
+        if (
+            self._fuse_shared_experts_inside_sbo
+            and not self._enable_shared_expert_balance
+        ):
             shared_output = None
 
             def _pre_combine_hook(
@@ -1156,6 +1229,77 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             return None
+
+    def _forward_shared_experts_balanced(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute shared experts with load balancing across EP ranks.
+
+        Each rank only computes shared expert for tokens assigned to it by the
+        waterfill algorithm. The assignment is deterministic, so all ranks agree
+        on who computes what without communication.
+
+        Args:
+            hidden_states: [num_tokens, hidden_size] input tensor
+            topk_ids: [num_tokens, topk] routed expert IDs
+            gemm_output_zero_allocator: Optional allocator for output tensors
+
+        Returns:
+            shared_output: [num_tokens, hidden_size] tensor with partial results.
+                          Only tokens assigned to this rank have non-zero values.
+                          After All-Reduce, all shared expert outputs are combined.
+        """
+        if hidden_states.shape[0] == 0 or self.num_fused_shared_experts != 0:
+            return None
+
+        if not hasattr(self, "shared_experts"):
+            return None
+
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+        device = hidden_states.device
+
+        # Get my token indices using the CUDA Graph compatible method
+        # - In CUDA Graph mode: uses static round-robin (fixed shapes)
+        # - In eager mode: uses dynamic waterfill (optimal balance)
+        my_token_indices = self.shared_expert_balancer.get_my_indices(
+            topk_ids=topk_ids,
+            num_tokens=num_tokens,
+            device=device,
+        )
+
+        if my_token_indices.shape[0] == 0:
+            # This rank has no tokens to compute, return zeros
+            return torch.zeros(
+                num_tokens,
+                hidden_size,
+                dtype=hidden_states.dtype,
+                device=device,
+            )
+
+        # Compute shared experts only for assigned tokens
+        my_hidden_states = hidden_states[my_token_indices]
+        my_shared_output = self.shared_experts(
+            my_hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+        )
+
+        # Create full output tensor with zeros, fill in computed results
+        # Use scatter_ for CUDA Graph compatibility
+        shared_output = torch.zeros(
+            num_tokens,
+            hidden_size,
+            dtype=hidden_states.dtype,
+            device=device,
+        )
+        # Expand indices for scatter: [num_my_tokens] -> [num_my_tokens, hidden_size]
+        indices_expanded = my_token_indices.unsqueeze(-1).expand(-1, hidden_size)
+        shared_output.scatter_(0, indices_expanded, my_shared_output)
+
+        return shared_output
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(

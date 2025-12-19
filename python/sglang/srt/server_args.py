@@ -436,6 +436,8 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    enable_shared_expert_balance: bool = False
+    shared_expert_balance_mode: Literal["uniform", "waterfill"] = "waterfill"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -1724,6 +1726,23 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        # Validate shared expert balance
+        if self.enable_shared_expert_balance:
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "--enable-shared-expert-balance only supports --moe-a2a-backend none. "
+                    f"Got --moe-a2a-backend {self.moe_a2a_backend}."
+                )
+            if self.ep_size <= 1:
+                raise ValueError(
+                    "--enable-shared-expert-balance requires --ep-size > 1. "
+                    f"Got --ep-size {self.ep_size}."
+                )
+            logger.info(
+                "Shared expert load balancing is enabled. Shared expert computation "
+                "will be distributed across ranks based on routed expert load."
             )
 
     def _handle_eplb_and_dispatch(self):
@@ -3326,6 +3345,22 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--enable-shared-expert-balance",
+            action="store_true",
+            help="Enable shared expert load balancing in EP mode with --moe-a2a-backend none. "
+            "Distributes shared expert computation across ranks based on routed expert load "
+            "to improve overall load balance.",
+        )
+        parser.add_argument(
+            "--shared-expert-balance-mode",
+            type=str,
+            choices=["uniform", "waterfill"],
+            default=ServerArgs.shared_expert_balance_mode,
+            help="Mode for shared expert load balancing. 'uniform': static round-robin "
+            "(each rank computes tokens[rank::world_size]). 'waterfill': dynamic load "
+            "balancing based on routed expert load. Default is 'waterfill'.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
