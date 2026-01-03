@@ -252,3 +252,12 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+
+# Local benchmark and test files (not for commit)
+test/srt/benchmark_shared_expert_balance.py
+test/srt/compare_maxtp_results.py
+test/srt/compare_results.py
+test/srt/run_max_throughput_benchmark.sh
+test/srt/run_shared_expert_benchmark.sh
+test/srt/test_shared_expert_balance_e2e.py
+test/srt/test_shared_expert_balancer.py
