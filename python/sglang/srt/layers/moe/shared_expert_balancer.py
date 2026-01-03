@@ -46,7 +46,7 @@ FAKE_SYNC_EXPERIMENT = os.environ.get("SGLANG_FAKE_SYNC_EXPERIMENT", "0") == "1"
 
 from torch import Tensor
 
-# ============== Triton Kernels for Waterfill (currently disabled) ==============
+# ============== Optimized Triton Kernels for Waterfill ==============
 # MoE-style implementation: avoids CPU-GPU sync by keeping count on GPU
 # Returns (indices_buffer, count_tensor) instead of sliced tensor
 
@@ -65,7 +65,9 @@ if HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Simple round-robin assignment kernel (unused when use_triton=False).
+        Single fused kernel: compute rank assignment and filter indices.
+        Uses simple uniform distribution (1/world_size per rank).
+        This avoids the histogram computation overhead.
         """
         pid = tl.program_id(0)
         block_start = pid * BLOCK_SIZE
@@ -73,7 +75,10 @@ if HAS_TRITON:
         for i in range(BLOCK_SIZE):
             token_idx = block_start + i
             if token_idx < num_tokens:
+                # Simple round-robin assignment based on token position
+                # This is equivalent to uniform distribution
                 assigned_rank = token_idx % world_size
+
                 if assigned_rank == rank:
                     out_idx = tl.atomic_add(output_count_ptr, 1)
                     tl.store(output_indices_ptr + out_idx, token_idx)
@@ -187,8 +192,10 @@ def get_my_indices_triton_v2(
     buffers: "TritonWaterfillBuffers",
 ) -> tuple:
     """
-    Simple round-robin assignment using Triton kernel.
-    Note: This is currently disabled (use_triton=False by default).
+    MoE-style Triton implementation: returns (indices_buffer, count_tensor).
+
+    Key difference from v1: NO .item() call, count stays on GPU.
+    Subsequent kernels read count via tl.load(count_ptr).
 
     Returns:
         indices_buffer: [max_tokens] tensor, valid indices in [:count]
@@ -198,15 +205,17 @@ def get_my_indices_triton_v2(
         raise RuntimeError("Triton not available")
 
     num_tokens = topk_ids.shape[0]
-    topk = topk_ids.shape[1]
-    experts_per_rank = num_experts // world_size
+    device = topk_ids.device
 
     buffers.resize_if_needed(num_tokens)
     buffers.count.zero_()
 
     BLOCK_SIZE = 256
     num_blocks = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    topk = topk_ids.shape[1]
+    experts_per_rank = num_experts // world_size
 
+    # Single kernel: assign and filter
     _waterfill_assign_kernel[(num_blocks,)](
         topk_ids,
         buffers.indices_buffer,
@@ -236,7 +245,7 @@ def gather_hidden_states_triton(
         hidden_states: [num_tokens, hidden_size] input
         indices_buffer: [max_tokens] indices from get_my_indices_triton_v2
         count_tensor: [1] count tensor on GPU
-        output_buffer: [max_count, hidden_size] pre-allocated output (FIX: smaller than indices_buffer)
+        output_buffer: [max_tokens, hidden_size] pre-allocated output
 
     Returns:
         output_buffer with gathered states (valid data in [:count])
@@ -244,14 +253,12 @@ def gather_hidden_states_triton(
     if not HAS_TRITON:
         raise RuntimeError("Triton not available")
 
-    # FIX: Use output_buffer size as the limit, not indices_buffer size
-    # output_buffer is sized to max_count = (num_tokens + world_size - 1) // world_size
-    max_tokens = output_buffer.shape[0]
+    max_tokens = indices_buffer.shape[0]
     hidden_size = hidden_states.shape[1]
 
     BLOCK_SIZE = 128
 
-    # Launch enough blocks for max possible tokens this rank can have
+    # Launch enough blocks for max possible tokens
     # Kernel internally checks against actual count
     _gather_hidden_states_kernel[(max_tokens,)](
         hidden_states,
@@ -276,8 +283,8 @@ def scatter_output_triton(
     Scatter computed results back to original positions (no CPU sync).
 
     Args:
-        computed_output: [max_count, hidden_size] computed results (FIX: smaller buffer)
-        indices_buffer: [num_tokens] indices
+        computed_output: [max_tokens, hidden_size] computed results
+        indices_buffer: [max_tokens] indices
         count_tensor: [1] count tensor on GPU
         full_output: [num_tokens, hidden_size] output tensor
 
@@ -287,8 +294,7 @@ def scatter_output_triton(
     if not HAS_TRITON:
         raise RuntimeError("Triton not available")
 
-    # FIX: Use computed_output size as the limit
-    max_tokens = computed_output.shape[0]
+    max_tokens = indices_buffer.shape[0]
     hidden_size = computed_output.shape[1]
 
     BLOCK_SIZE = 128
@@ -556,7 +562,7 @@ class SharedExpertBalancer:
         use_vectorized: bool = False,
         use_waterfill: bool = True,
         use_fast_algorithm: bool = True,
-        use_triton: bool = False,  # Disabled: sync-free approach has limitations
+        use_triton: bool = True,  # Enabled: Use Triton kernel for sync-free waterfill
     ):
         """
         Initialize the SharedExpertBalancer.
@@ -848,107 +854,6 @@ class SharedExpertBalancer:
             )
 
         return buf.gathered_hidden
-
-    def forward_shared_experts_sync_free(
-        self,
-        hidden_states: Tensor,
-        topk_ids: Tensor,
-        shared_expert_fn,
-        output_buffer: Optional[Tensor] = None,
-    ) -> Tensor:
-        """
-        Complete sync-free forward pass for shared experts using Triton kernels.
-
-        This method provides a fully GPU-resident pipeline:
-        1. Compute indices and count (count stays on GPU)
-        2. Gather hidden states using Triton kernel (reads count via tl.load)
-        3. Compute shared experts
-        4. Scatter results back using Triton kernel (reads count via tl.load)
-
-        No CPU-GPU synchronization occurs in this pipeline.
-
-        Args:
-            hidden_states: [num_tokens, hidden_size] input tensor
-            topk_ids: [num_tokens, topk] tensor of selected expert IDs
-            shared_expert_fn: Callable that computes shared expert output
-                              signature: fn(hidden_states) -> output
-            output_buffer: Optional pre-allocated output buffer [num_tokens, hidden_size]
-
-        Returns:
-            shared_output: [num_tokens, hidden_size] tensor with computed results
-                          (zeros for tokens not assigned to this rank)
-        """
-        if not HAS_TRITON:
-            raise RuntimeError("Triton not available for sync-free forward")
-
-        num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-        dtype = hidden_states.dtype
-        device = hidden_states.device
-
-        # FIX: Use max_count instead of num_tokens for gathered_buffer
-        # Each rank processes at most (num_tokens + world_size - 1) // world_size tokens
-        # This reduces memory usage by world_size (8x for TP8)
-        max_count = (num_tokens + self.world_size - 1) // self.world_size
-
-        # Ensure buffers are allocated
-        if self._triton_buffers is None:
-            self._triton_buffers = TritonWaterfillBuffers(
-                max_tokens=num_tokens,  # indices_buffer still needs full size
-                world_size=self.world_size,
-                device=device,
-            )
-        # FIX: Only resize indices_buffer to num_tokens (for storing all token indices)
-        # Don't pass hidden_size here - gathered_hidden is allocated separately with max_count
-        self._triton_buffers.resize_if_needed(num_tokens)  # No hidden_size!
-
-        # Step 1: Get indices and count (both on GPU, no sync)
-        indices_buffer, count_tensor = get_my_indices_triton_v2(
-            topk_ids,
-            self.num_experts,
-            self.world_size,
-            self.rank,
-            self._triton_buffers,
-        )
-
-        # Step 2: Ensure gathered buffer and zero it
-        # FIX: Use max_count instead of num_tokens to reduce memory by world_size
-        # IMPORTANT: Must zero the buffer because gather kernel only writes
-        # valid positions ([:count]). Invalid positions would contain garbage
-        # data which causes issues when shared_experts processes the full buffer.
-        gathered_buffer = self.ensure_gathered_buffer(
-            max_count, hidden_size, dtype, device
-        )
-        gathered_buffer.zero_()  # Clear garbage data from previous calls
-
-        # Step 3: Gather hidden states using Triton (reads count from GPU)
-        gather_hidden_states_triton(
-            hidden_states,
-            indices_buffer,
-            count_tensor,
-            gathered_buffer,
-        )
-
-        # Step 4: Compute shared experts
-        computed_output = shared_expert_fn(gathered_buffer)
-
-        # Step 5: Prepare output buffer
-        if output_buffer is None:
-            output_buffer = torch.zeros(
-                num_tokens, hidden_size, dtype=dtype, device=device
-            )
-        else:
-            output_buffer.zero_()
-
-        # Step 6: Scatter results back using Triton (reads count from GPU)
-        scatter_output_triton(
-            computed_output,
-            indices_buffer,
-            count_tensor,
-            output_buffer,
-        )
-
-        return output_buffer
 
 
 def compute_imbalance_score(
