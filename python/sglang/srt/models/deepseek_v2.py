@@ -95,7 +95,10 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
-from sglang.srt.layers.moe.shared_expert_balancer import SharedExpertBalancer
+from sglang.srt.layers.moe.shared_expert_balancer import (
+    SharedExpertBalancer,
+    is_cuda_graph_capturing,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1243,6 +1246,10 @@ class DeepseekV2MoE(nn.Module):
         waterfill algorithm. The assignment is deterministic, so all ranks agree
         on who computes what without communication.
 
+        This method supports two modes:
+        1. Sync-free mode (Triton): Uses GPU-resident count, no CPU-GPU sync
+        2. Legacy mode (PyTorch): Uses .item() for count, has sync overhead
+
         Args:
             hidden_states: [num_tokens, hidden_size] input tensor
             topk_ids: [num_tokens, topk] routed expert IDs
@@ -1263,9 +1270,30 @@ class DeepseekV2MoE(nn.Module):
         hidden_size = hidden_states.shape[1]
         device = hidden_states.device
 
-        # Get my token indices using the CUDA Graph compatible method
-        # - In CUDA Graph mode: uses static round-robin (fixed shapes)
-        # - In eager mode: uses dynamic waterfill (optimal balance)
+        # Check if we should use sync-free Triton path
+        # Use sync-free for: dynamic mode (prefill) + Triton available + large batch
+        use_sync_free = (
+            self.shared_expert_balancer.use_triton
+            and not is_cuda_graph_capturing()
+            and self.shared_expert_balancer.use_waterfill
+            and num_tokens >= self.shared_expert_balancer.MIN_BATCH_FOR_BALANCE
+        )
+
+        if use_sync_free:
+            # Sync-free path: all operations stay on GPU, no CPU-GPU sync
+            def shared_expert_fn(gathered_hidden):
+                return self.shared_experts(
+                    gathered_hidden,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                )
+
+            return self.shared_expert_balancer.forward_shared_experts_sync_free(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                shared_expert_fn=shared_expert_fn,
+            )
+
+        # Legacy path: uses get_my_indices which may have .item() sync
         my_token_indices = self.shared_expert_balancer.get_my_indices(
             topk_ids=topk_ids,
             num_tokens=num_tokens,
