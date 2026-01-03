@@ -1280,6 +1280,33 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if use_sync_free:
+            # #region agent log - H4/H5: Track per-layer sync-free calls
+            import json as _json
+            import time as _time
+
+            try:
+                with open("/home/xutingz/workspace/.cursor/debug.log", "a") as _f:
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "hypothesisId": "H5",
+                                "location": "_forward_shared_experts_balanced",
+                                "message": "Sync-free path called",
+                                "data": {
+                                    "num_tokens": num_tokens,
+                                    "hidden_size": hidden_size,
+                                    "layer_id": getattr(self, "_layer_id", "unknown"),
+                                },
+                                "timestamp": int(_time.time() * 1000),
+                                "sessionId": "debug-session",
+                            }
+                        )
+                        + "\n"
+                    )
+            except:
+                pass
+
+            # #endregion
             # Sync-free path: all operations stay on GPU, no CPU-GPU sync
             def shared_expert_fn(gathered_hidden):
                 return self.shared_experts(
