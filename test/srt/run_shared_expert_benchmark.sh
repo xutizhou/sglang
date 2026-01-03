@@ -1,23 +1,24 @@
 #!/bin/bash
 # Shared Expert Load Balancing Benchmark Script
 #
-# Three experiments:
+# Four experiments:
 # 1. Shared Expert TP8 (baseline)
 # 2. Shared Expert DP (Replicated) + Uniform (no load balancing)
-# 3. Shared Expert DP (Replicated) + Waterfill for Prefill, Uniform for Decode (CUDA Graph compatible)
+# 3. Shared Expert DP (Replicated) + Waterfill (with sync overhead)
+# 4. Shared Expert DP (Replicated) + Waterfill + Fake Sync (no sync overhead)
 
 set -e
 
 MODEL_PATH="/lustre/raplab/client/xutingz/workspace/model/DeepSeek-V3/"
 HOST="0.0.0.0"
 PORT=30000
-RESULT_DIR="/tmp/shared_expert_benchmark"
+RESULT_DIR="/lustre/raplab/client/xutingz/workspace/bench/torch_profile/$(date +%Y%m%d_%H%M%S)"
 
 # Benchmark parameters
-NUM_PROMPTS=500
+NUM_PROMPTS=512
 RANDOM_INPUT=1024
-RANDOM_OUTPUT=1024
-REQUEST_RATE=4
+RANDOM_OUTPUT=1
+MAX_CONCURRENCY=32
 
 mkdir -p ${RESULT_DIR}
 
@@ -52,7 +53,7 @@ run_benchmark() {
         --num-prompts ${NUM_PROMPTS} \
         --random-input ${RANDOM_INPUT} \
         --random-output ${RANDOM_OUTPUT} \
-        --request-rate ${REQUEST_RATE} \
+        --max-concurrency ${MAX_CONCURRENCY} \
         --model ${MODEL_PATH} \
         --output-file ${output_file}
 
@@ -75,6 +76,11 @@ print(f\"  Mean TTFT: {d['mean_ttft_ms']:.2f} ms\")
 echo "=========================================="
 echo "Shared Expert Load Balancing Benchmark"
 echo "=========================================="
+echo "Parameters:"
+echo "  NUM_PROMPTS: ${NUM_PROMPTS}"
+echo "  RANDOM_INPUT: ${RANDOM_INPUT}"
+echo "  RANDOM_OUTPUT: ${RANDOM_OUTPUT}"
+echo "  MAX_CONCURRENCY: ${MAX_CONCURRENCY}"
 echo ""
 
 # ==========================================
@@ -163,6 +169,38 @@ extract_metrics "${RESULT_DIR}/exp3_dp_waterfill.jsonl"
 echo ""
 
 # ==========================================
+# Experiment 4: Shared Expert DP + Waterfill + Fake Sync
+# This runs waterfill computation but skips the CPU-GPU sync
+# by returning fake uniform indices. Measures sync overhead.
+# ==========================================
+echo "=========================================="
+echo "Experiment 4: Shared Expert DP + Waterfill (Fake Sync)"
+echo "  (Runs waterfill but skips nonzero() sync)"
+echo "  (Returns uniform indices - measures sync overhead)"
+echo "=========================================="
+kill_server
+
+SGLANG_FAKE_SYNC_EXPERIMENT=1 python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --tp 8 \
+    --ep 8 \
+    --moe-a2a-backend none \
+    --enable-shared-expert-balance \
+    --shared-expert-balance-mode waterfill \
+    --host ${HOST} \
+    --port ${PORT} \
+    --trust-remote-code \
+    > ${RESULT_DIR}/exp4_server.log 2>&1 &
+
+wait_for_server
+run_benchmark "exp4_dp_waterfill_fake_sync"
+
+echo ""
+echo "Experiment 4 Results:"
+extract_metrics "${RESULT_DIR}/exp4_dp_waterfill_fake_sync.jsonl"
+echo ""
+
+# ==========================================
 # Summary
 # ==========================================
 kill_server
@@ -177,8 +215,13 @@ echo ""
 echo "Experiment 2 (DP + Uniform):"
 extract_metrics "${RESULT_DIR}/exp2_dp_uniform.jsonl"
 echo ""
-echo "Experiment 3 (DP + Waterfill/Uniform):"
+echo "Experiment 3 (DP + Waterfill - with sync):"
 extract_metrics "${RESULT_DIR}/exp3_dp_waterfill.jsonl"
+echo ""
+echo "Experiment 4 (DP + Waterfill - fake sync, no overhead):"
+extract_metrics "${RESULT_DIR}/exp4_dp_waterfill_fake_sync.jsonl"
+echo ""
+echo "If Exp4 >> Exp3, then sync is the bottleneck!"
 echo ""
 echo "All results saved to: ${RESULT_DIR}/"
 echo "=========================================="
