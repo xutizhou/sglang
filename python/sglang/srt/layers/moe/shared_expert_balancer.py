@@ -28,6 +28,7 @@ Two kernel implementations:
 Environment variables:
 - SGLANG_USE_TRITON_WATERFILL=0/1: Use Triton kernel (default: 1)
 - SGLANG_FAKE_SYNC_EXPERIMENT=0/1: Skip .item() sync for benchmarking (default: 0)
+- SGLANG_FAKE_DISPATCH=0/1: Use uniform dispatch while running waterfill algorithm (default: 0)
 """
 
 import os
@@ -47,6 +48,12 @@ except ImportError:
 # ============== Environment Variables ==============
 USE_TRITON_WATERFILL = os.environ.get("SGLANG_USE_TRITON_WATERFILL", "1") == "1"
 FAKE_SYNC_EXPERIMENT = os.environ.get("SGLANG_FAKE_SYNC_EXPERIMENT", "0") == "1"
+FAKE_DISPATCH = os.environ.get("SGLANG_FAKE_DISPATCH", "0") == "1"
+LOG_LOAD_DISTRIBUTION = os.environ.get("SGLANG_LOG_LOAD_DISTRIBUTION", "0") == "1"
+
+# Global counter for logging frequency
+_log_counter = 0
+_LOG_INTERVAL = 100  # Log every N calls
 
 
 # ============== Triton Kernels for Waterfill ==============
@@ -256,7 +263,37 @@ def get_my_indices_triton(
     else:
         count = buffers.count[0].item()
 
-    return buffers.indices_buffer[:count].clone()
+    # Log load distribution for analysis
+    if LOG_LOAD_DISTRIBUTION:
+        global _log_counter
+        _log_counter += 1
+        if _log_counter % _LOG_INTERVAL == 0:
+            routed = buffers.histogram.tolist()
+            routed_max = max(routed)
+            routed_avg = sum(routed) / len(routed) if routed else 1
+            routed_ratio = routed_max / routed_avg if routed_avg > 0 else 1.0
+            # Compute shared counts per rank (waterfill assignment)
+            shared_counts = [0] * world_size
+            if not FAKE_DISPATCH:
+                # Count how many tokens assigned to each rank
+                assigned_indices = buffers.indices_buffer[:count].tolist()
+                for idx in assigned_indices:
+                    assigned_rank = idx % world_size  # This is simplified
+                shared_counts[rank] = count
+            else:
+                shared_counts[rank] = uniform_count
+            print(
+                f"[LoadDist] rank={rank} routed={routed} shared_my={count} "
+                f"routed_max/avg={routed_ratio:.3f} num_tokens={num_tokens}"
+            )
+
+    # Return indices based on dispatch mode
+    if FAKE_DISPATCH:
+        # Use uniform dispatch (ignore waterfill assignment) while still running algorithm
+        return uniform_indices
+    else:
+        # Use actual waterfill assignment
+        return buffers.indices_buffer[:count].clone()
 
 
 # ============== PyTorch Implementation ==============
