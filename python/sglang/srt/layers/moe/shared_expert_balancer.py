@@ -50,10 +50,17 @@ USE_TRITON_WATERFILL = os.environ.get("SGLANG_USE_TRITON_WATERFILL", "1") == "1"
 FAKE_SYNC_EXPERIMENT = os.environ.get("SGLANG_FAKE_SYNC_EXPERIMENT", "0") == "1"
 FAKE_DISPATCH = os.environ.get("SGLANG_FAKE_DISPATCH", "0") == "1"
 LOG_LOAD_DISTRIBUTION = os.environ.get("SGLANG_LOG_LOAD_DISTRIBUTION", "0") == "1"
+LOG_LOAD_FILE = os.environ.get(
+    "SGLANG_LOG_LOAD_FILE",
+    "/lustre/raplab/client/xutingz/workspace/bench/waterfill_analysis.jsonl",
+)
 
 # Global counter for logging frequency
 _log_counter = 0
-_LOG_INTERVAL = 100  # Log every N calls
+_LOG_INTERVAL = 10  # Log every N calls
+_LOG_SKIP_FIRST = 500  # Skip first N calls (warmup)
+_LOG_MIN_TOKENS = 32  # Only log batches with >= this many tokens
+_log_file_handle = None
 
 
 # ============== Triton Kernels for Waterfill ==============
@@ -265,26 +272,95 @@ def get_my_indices_triton(
 
     # Log load distribution for analysis
     if LOG_LOAD_DISTRIBUTION:
-        global _log_counter
+        global _log_counter, _log_file_handle
         _log_counter += 1
-        if _log_counter % _LOG_INTERVAL == 0:
+
+        # Skip warmup and small batches
+        should_log = (
+            _log_counter > _LOG_SKIP_FIRST
+            and _log_counter % _LOG_INTERVAL == 0
+            and num_tokens >= _LOG_MIN_TOKENS
+        )
+
+        if should_log:
+            import json
+            import time
+
+            # 1. Routed tokens per rank (from histogram)
             routed = buffers.histogram.tolist()
-            routed_max = max(routed)
+            routed_max = max(routed) if routed else 0
             routed_avg = sum(routed) / len(routed) if routed else 1
             routed_ratio = routed_max / routed_avg if routed_avg > 0 else 1.0
-            # Compute shared counts per rank (waterfill assignment)
-            shared_counts = [0] * world_size
-            if not FAKE_DISPATCH:
-                # Count how many tokens assigned to each rank
-                assigned_indices = buffers.indices_buffer[:count].tolist()
-                for idx in assigned_indices:
-                    assigned_rank = idx % world_size  # This is simplified
-                shared_counts[rank] = count
-            else:
-                shared_counts[rank] = uniform_count
+
+            # 2. Compute waterfill shared tokens for ALL ranks
+            # Use the cumulative weights to compute each rank's share
+            cum_weights_cpu = buffers.cum_weights.cpu().tolist()
+            waterfill_shared = []
+            prev_w = 0.0
+            for i in range(world_size):
+                w = cum_weights_cpu[i]
+                # Share for rank i = (w - prev_w) * num_tokens
+                share = int(round((w - prev_w) * num_tokens))
+                waterfill_shared.append(share)
+                prev_w = w
+
+            # 3. Uniform shared tokens for each rank
+            uniform_shared = []
+            base = num_tokens // world_size
+            remainder = num_tokens % world_size
+            for i in range(world_size):
+                # Uniform: rank i gets tokens[i::world_size]
+                uniform_shared.append(base + (1 if i < remainder else 0))
+
+            # 4. Total load per rank
+            waterfill_total = [
+                routed[i] + waterfill_shared[i] for i in range(world_size)
+            ]
+            uniform_total = [routed[i] + uniform_shared[i] for i in range(world_size)]
+
+            # 5. Max load reduction
+            wf_max_total = max(waterfill_total)
+            uni_max_total = max(uniform_total)
+            reduction = uni_max_total - wf_max_total
+            reduction_pct = reduction / uni_max_total * 100 if uni_max_total > 0 else 0
+
+            log_entry = {
+                "timestamp": time.time(),
+                "call_count": _log_counter,
+                "rank": rank,
+                "num_tokens": num_tokens,
+                # Routed tokens per rank
+                "routed_per_rank": routed,
+                "routed_max": routed_max,
+                "routed_ratio": round(routed_ratio, 3),
+                # Shared tokens per rank (waterfill)
+                "waterfill_shared_per_rank": waterfill_shared,
+                # Shared tokens per rank (uniform)
+                "uniform_shared_per_rank": uniform_shared,
+                # Total load per rank
+                "waterfill_total_per_rank": waterfill_total,
+                "uniform_total_per_rank": uniform_total,
+                # Reduction metrics
+                "waterfill_max_total": wf_max_total,
+                "uniform_max_total": uni_max_total,
+                "max_reduction": reduction,
+                "max_reduction_pct": round(reduction_pct, 2),
+                # Current rank's actual count
+                "my_shared_count": count,
+            }
+
+            # Write to file
+            if _log_file_handle is None:
+                _log_file_handle = open(LOG_LOAD_FILE, "a")
+            _log_file_handle.write(json.dumps(log_entry) + "\n")
+            _log_file_handle.flush()
+
+            # Also print summary
             print(
-                f"[LoadDist] rank={rank} routed={routed} shared_my={count} "
-                f"routed_max/avg={routed_ratio:.3f} num_tokens={num_tokens}"
+                f"[LoadDist] #{_log_counter} n={num_tokens} "
+                f"routed_max/avg={routed_ratio:.2f}x "
+                f"wf_max={wf_max_total} uni_max={uni_max_total} "
+                f"reduction={reduction} ({reduction_pct:.1f}%)"
             )
 
     # Return indices based on dispatch mode
