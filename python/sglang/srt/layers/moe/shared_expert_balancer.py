@@ -54,6 +54,8 @@ LOG_LOAD_FILE = os.environ.get(
     "SGLANG_LOG_LOAD_FILE",
     "/lustre/raplab/client/xutingz/workspace/bench/waterfill_analysis.jsonl",
 )
+# 详细日志：每次调用都打印 token 分布（用于调试）
+LOG_WATERFILL_VERBOSE = os.environ.get("SGLANG_LOG_WATERFILL_VERBOSE", "0") == "1"
 
 # Global counter for logging frequency
 _log_counter = 0
@@ -245,12 +247,39 @@ def get_my_indices_triton(
         BLOCK_SIZE,
     )
 
-    # Compute inverse weights on GPU (small tensor, fast)
-    routed_counts = buffers.histogram.float()
-    max_routed = routed_counts.max()
-    inverse_load = max_routed - routed_counts + 1.0
-    weights = inverse_load / inverse_load.sum()
-    buffers.cum_weights.copy_(torch.cumsum(weights, dim=0))
+    # Compute waterfill distribution on GPU
+    # Use the new waterfill algorithm that can assign ZERO to high-load ranks
+    routed_counts = buffers.histogram.to(torch.int64)
+    target_totals = waterfill(routed_counts, num_tokens)
+    shared_per_rank = target_totals - routed_counts
+    shared_per_rank = torch.clamp(shared_per_rank, min=0)  # Safety: no negative
+
+    # 详细日志：打印每次调用的 token 分布
+    if LOG_WATERFILL_VERBOSE:
+        routed_list = routed_counts.tolist()
+        shared_list = shared_per_rank.tolist()
+        total_list = target_totals.tolist()
+        min_shared = min(shared_list)
+        max_total = max(total_list)
+        zeros = sum(1 for s in shared_list if s == 0)
+        small = sum(1 for s in shared_list if 0 < s < 10)
+        print(
+            f"[WF] n={num_tokens} rank={rank} | "
+            f"routed={routed_list} | "
+            f"shared={shared_list} | "
+            f"zeros={zeros} small(<10)={small} min_shared={min_shared} max_total={max_total}"
+        )
+
+    # Convert to cumulative bounds for token assignment
+    # Token i is assigned to rank r if cum_bounds[r-1] <= i < cum_bounds[r]
+    cum_bounds = torch.cumsum(shared_per_rank, dim=0).float()
+    # Normalize to [0, 1] for the kernel
+    total_shared = cum_bounds[-1].item()
+    if total_shared > 0:
+        buffers.cum_weights.copy_(cum_bounds / total_shared)
+    else:
+        # Edge case: no shared tokens at all
+        buffers.cum_weights.fill_(1.0)
 
     # Kernel 2: Assign tokens based on cumulative weights + filter
     _waterfill_assign_filter_kernel[(num_blocks,)](
@@ -293,16 +322,8 @@ def get_my_indices_triton(
             routed_ratio = routed_max / routed_avg if routed_avg > 0 else 1.0
 
             # 2. Compute waterfill shared tokens for ALL ranks
-            # Use the cumulative weights to compute each rank's share
-            cum_weights_cpu = buffers.cum_weights.cpu().tolist()
-            waterfill_shared = []
-            prev_w = 0.0
-            for i in range(world_size):
-                w = cum_weights_cpu[i]
-                # Share for rank i = (w - prev_w) * num_tokens
-                share = int(round((w - prev_w) * num_tokens))
-                waterfill_shared.append(share)
-                prev_w = w
+            # Use the actual shared_per_rank from waterfill algorithm
+            waterfill_shared = shared_per_rank.tolist()
 
             # 3. Uniform shared tokens for each rank
             uniform_shared = []
@@ -383,42 +404,50 @@ def is_cuda_graph_capturing() -> bool:
         return False
 
 
-def waterfill(routed_counts: Tensor, total_shared: int) -> Tensor:
+def waterfill(
+    routed_counts: Tensor, total_shared: int, min_shared_threshold: int = 8
+) -> Tensor:
     """
-    Waterfill algorithm to distribute shared tokens across ranks.
+    Optimized waterfill algorithm to distribute shared tokens across ranks.
+
+    Strategy: Use inverse-proportional weights (more tokens to lower-loaded ranks),
+    then set small values to 0 to avoid kernel launch overhead for tiny batches.
+
+    This is optimized for GPU execution with no CPU-GPU synchronization.
+
+    Args:
+        routed_counts: Routed tokens per rank
+        total_shared: Total shared tokens to distribute
+        min_shared_threshold: Minimum shared tokens to assign (smaller values set to 0)
+
+    Returns: Target TOTAL load per rank (routed + shared)
     """
-    world_size = routed_counts.shape[0]
-    device = routed_counts.device
+    routed = routed_counts.float()
+    max_routed = routed.max()
 
-    vals, idx = torch.sort(routed_counts.clone().to(torch.int64))
-    cum_vals = torch.cumsum(vals, dim=0)
-    k_range = torch.arange(1, world_size + 1, device=device)
-    costs = k_range * vals - cum_vals
+    # Compute inverse-proportional weights
+    # Lower routed load -> higher weight -> more shared tokens
+    w = max_routed - routed + 1.0
+    w = w / w.sum()
 
-    can_fill = costs <= total_shared
-    k_idx = torch.sum(can_fill.to(torch.int64)) - 1
-    k_idx = torch.clamp(k_idx, 0, world_size - 1)
+    # Direct shared calculation using floor + adjustment
+    # This avoids rounding issues and is faster
+    shared_float = w * total_shared
+    shared = shared_float.floor().to(torch.int64)
 
-    cost_at_k = torch.gather(costs, 0, k_idx.unsqueeze(0)).squeeze(0)
-    vals_at_k = torch.gather(vals, 0, k_idx.unsqueeze(0)).squeeze(0)
+    # Add remainder to rank with lowest routed (highest weight)
+    # Use scatter_add for fully GPU execution (no sync)
+    remainder = total_shared - shared.sum()
+    min_idx = routed.argmin().view(1)
+    shared = shared.scatter_add(0, min_idx, remainder.view(1))
 
-    remaining_after_fill = total_shared - cost_at_k
-    base_level = vals_at_k
+    # Threshold processing: set small values to 0
+    # This avoids kernel launch overhead for tiny batches
+    shared = torch.where(
+        shared < min_shared_threshold, torch.zeros_like(shared), shared
+    )
 
-    divisor = k_idx + 1
-    inc_all = remaining_after_fill // divisor
-    rem = remaining_after_fill % divisor
-
-    mask = torch.arange(world_size, device=device) <= k_idx
-    vals = torch.where(mask, base_level + inc_all, vals)
-
-    rem_mask = torch.arange(world_size, device=device) < rem
-    vals = torch.where(rem_mask, vals + 1, vals)
-
-    target = torch.empty_like(vals)
-    target[idx] = vals
-
-    return target
+    return routed_counts + shared
 
 
 def assign_shared_expert(
