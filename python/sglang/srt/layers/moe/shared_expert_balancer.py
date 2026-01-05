@@ -69,6 +69,89 @@ _log_file_handle = None
 if HAS_TRITON:
 
     @triton.jit
+    def _waterfill_compute_kernel(
+        routed_ptr,  # [world_size] routed counts per rank (int32)
+        cum_weights_ptr,  # [world_size] output cumulative weights (float32)
+        shared_ptr,  # [world_size] output shared tokens per rank (int32)
+        total_shared,  # Total shared tokens to distribute
+        min_threshold: tl.constexpr,  # Minimum shared tokens threshold
+        WORLD_SIZE: tl.constexpr,  # world_size (typically 8)
+    ):
+        """
+        Fused waterfill computation kernel.
+
+        Computes inverse-proportional weights, calculates shared tokens per rank,
+        handles remainder distribution, and applies threshold - all in one kernel.
+
+        Since world_size is small (8), this runs on a single thread block.
+        """
+        # Load all routed counts into registers
+        routed = tl.zeros([8], dtype=tl.int32)
+        for i in range(WORLD_SIZE):
+            routed = tl.where(
+                tl.arange(0, 8) == i,
+                tl.load(routed_ptr + i),
+                routed,
+            )
+
+        # Find max routed
+        max_routed = tl.max(routed)
+
+        # Compute inverse weights: w = max - routed + 1
+        inv_weights = (max_routed - routed + 1).to(tl.float32)
+
+        # Normalize weights
+        sum_weights = tl.sum(inv_weights)
+        weights = inv_weights / sum_weights
+
+        # Compute cumulative weights for assignment kernel
+        cum_w = tl.zeros([8], dtype=tl.float32)
+        running_sum = 0.0
+        for i in range(WORLD_SIZE):
+            w_i = tl.sum(tl.where(tl.arange(0, 8) == i, weights, 0.0))
+            running_sum = running_sum + w_i
+            cum_w = tl.where(tl.arange(0, 8) == i, running_sum, cum_w)
+
+        # Store cumulative weights
+        for i in range(WORLD_SIZE):
+            cw = tl.sum(tl.where(tl.arange(0, 8) == i, cum_w, 0.0))
+            tl.store(cum_weights_ptr + i, cw)
+
+        # Compute shared tokens per rank: floor(weights * total)
+        shared_float = weights * total_shared.to(tl.float32)
+        shared = tl.math.floor(shared_float).to(tl.int32)
+
+        # Compute remainder
+        total_assigned = tl.sum(shared)
+        remainder = total_shared - total_assigned
+
+        # Add remainder to rank with lowest routed (highest weight)
+        # Find argmin of routed
+        min_routed = tl.min(routed)
+        is_min = routed == min_routed
+
+        # Add remainder to first rank that has min routed
+        remainder_added = tl.zeros([8], dtype=tl.int32)
+        found = 0
+        for i in range(WORLD_SIZE):
+            is_i = tl.arange(0, 8) == i
+            is_min_i = tl.sum(tl.where(is_i, is_min.to(tl.int32), 0))
+            add_here = (is_min_i > 0) & (found == 0)
+            if add_here:
+                remainder_added = tl.where(is_i, remainder, remainder_added)
+                found = 1
+
+        shared = shared + remainder_added
+
+        # Apply threshold: set small values to 0
+        shared = tl.where(shared < min_threshold, 0, shared)
+
+        # Store shared tokens per rank
+        for i in range(WORLD_SIZE):
+            s = tl.sum(tl.where(tl.arange(0, 8) == i, shared, 0))
+            tl.store(shared_ptr + i, s)
+
+    @triton.jit
     def _histogram_kernel(
         topk_ids_ptr,
         histogram_ptr,
@@ -182,6 +265,7 @@ class TritonWaterfillBuffers:
         self.count = torch.zeros(1, dtype=torch.int32, device=device)
         self.histogram = torch.zeros(world_size, dtype=torch.int32, device=device)
         self.cum_weights = torch.zeros(world_size, dtype=torch.float32, device=device)
+        self.shared_per_rank = torch.zeros(world_size, dtype=torch.int32, device=device)
 
     def resize_if_needed(self, num_tokens: int):
         if num_tokens > self.max_tokens:
@@ -247,20 +331,25 @@ def get_my_indices_triton(
         BLOCK_SIZE,
     )
 
-    # Compute waterfill distribution on GPU
-    # Use the new waterfill algorithm that can assign ZERO to high-load ranks
-    routed_counts = buffers.histogram.to(torch.int64)
-    target_totals = waterfill(routed_counts, num_tokens)
-    shared_per_rank = target_totals - routed_counts
-    shared_per_rank = torch.clamp(shared_per_rank, min=0)  # Safety: no negative
+    # Kernel 2: Fused waterfill computation
+    # Computes inverse weights, shared per rank, cumulative weights - all in one kernel
+    MIN_THRESHOLD = 8  # Minimum shared tokens to assign
+    _waterfill_compute_kernel[(1,)](
+        buffers.histogram,
+        buffers.cum_weights,
+        buffers.shared_per_rank,
+        num_tokens,
+        MIN_THRESHOLD,
+        world_size,
+    )
 
     # 详细日志：打印每次调用的 token 分布
     if LOG_WATERFILL_VERBOSE:
-        routed_list = routed_counts.tolist()
-        shared_list = shared_per_rank.tolist()
-        total_list = target_totals.tolist()
+        routed_list = buffers.histogram.tolist()
+        shared_list = buffers.shared_per_rank.tolist()
+        total_list = [r + s for r, s in zip(routed_list, shared_list)]
         min_shared = min(shared_list)
-        max_total = max(total_list)
+        max_total = max(total_list) if total_list else 0
         zeros = sum(1 for s in shared_list if s == 0)
         small = sum(1 for s in shared_list if 0 < s < 10)
         print(
@@ -269,17 +358,6 @@ def get_my_indices_triton(
             f"shared={shared_list} | "
             f"zeros={zeros} small(<10)={small} min_shared={min_shared} max_total={max_total}"
         )
-
-    # Convert to cumulative bounds for token assignment
-    # Token i is assigned to rank r if cum_bounds[r-1] <= i < cum_bounds[r]
-    cum_bounds = torch.cumsum(shared_per_rank, dim=0).float()
-    # Normalize to [0, 1] for the kernel
-    total_shared = cum_bounds[-1].item()
-    if total_shared > 0:
-        buffers.cum_weights.copy_(cum_bounds / total_shared)
-    else:
-        # Edge case: no shared tokens at all
-        buffers.cum_weights.fill_(1.0)
 
     # Kernel 2: Assign tokens based on cumulative weights + filter
     _waterfill_assign_filter_kernel[(num_blocks,)](
@@ -322,8 +400,8 @@ def get_my_indices_triton(
             routed_ratio = routed_max / routed_avg if routed_avg > 0 else 1.0
 
             # 2. Compute waterfill shared tokens for ALL ranks
-            # Use the actual shared_per_rank from waterfill algorithm
-            waterfill_shared = shared_per_rank.tolist()
+            # Use the actual shared_per_rank from fused kernel
+            waterfill_shared = buffers.shared_per_rank.tolist()
 
             # 3. Uniform shared tokens for each rank
             uniform_shared = []
