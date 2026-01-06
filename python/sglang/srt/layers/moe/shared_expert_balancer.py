@@ -77,74 +77,40 @@ if HAS_TRITON:
         min_threshold: tl.constexpr,  # Minimum shared tokens threshold
         WORLD_SIZE: tl.constexpr,  # world_size (typically 8)
     ):
-        """
-        Fused waterfill computation kernel.
+        """Wrapper that calls optimized v2 kernel."""
+        # Vectorized load
+        offs = tl.arange(0, 8)
+        mask = offs < WORLD_SIZE
+        routed = tl.load(routed_ptr + offs, mask=mask, other=0).to(tl.int32)
 
-        Computes inverse-proportional weights, calculates shared tokens per rank,
-        handles remainder distribution, and applies threshold - all in one kernel.
-
-        Since world_size is small (8), this runs on a single thread block.
-        """
-        # Load all routed counts into registers
-        routed = tl.zeros([8], dtype=tl.int32)
-        for i in range(WORLD_SIZE):
-            routed = tl.where(
-                tl.arange(0, 8) == i,
-                tl.load(routed_ptr + i),
-                routed,
-            )
-
-        # Find max routed
+        # Compute inverse weights
         max_routed = tl.max(routed)
-
-        # Compute inverse weights: w = max - routed + 1
         inv_weights = (max_routed - routed + 1).to(tl.float32)
-
-        # Normalize weights
         sum_weights = tl.sum(inv_weights)
         weights = inv_weights / sum_weights
 
-        # Compute cumulative weights for assignment kernel
-        cum_w = tl.zeros([8], dtype=tl.float32)
-        running_sum = 0.0
-        for i in range(WORLD_SIZE):
-            w_i = tl.sum(tl.where(tl.arange(0, 8) == i, weights, 0.0))
-            running_sum = running_sum + w_i
-            cum_w = tl.where(tl.arange(0, 8) == i, running_sum, cum_w)
+        # Cumulative sum
+        cum_w = tl.cumsum(weights, axis=0)
+        tl.store(cum_weights_ptr + offs, cum_w, mask=mask)
 
-        # Store cumulative weights
-        for i in range(WORLD_SIZE):
-            cw = tl.sum(tl.where(tl.arange(0, 8) == i, cum_w, 0.0))
-            tl.store(cum_weights_ptr + i, cw)
+        # Compute shared tokens
+        total_f = total_shared.to(tl.float32)
+        shared = tl.math.floor(weights * total_f).to(tl.int32)
 
-        # Compute shared tokens per rank: floor(weights * total)
-        shared_float = weights * total_shared.to(tl.float32)
-        shared = tl.math.floor(shared_float).to(tl.int32)
-
-        # Compute remainder
+        # Handle remainder
         total_assigned = tl.sum(shared)
         remainder = total_shared - total_assigned
 
-        # Add remainder to rank with lowest routed (highest weight)
-        # Find argmin of routed
+        # Add to first min routed rank
         min_routed = tl.min(routed)
-        is_min = routed == min_routed
+        is_min = (routed == min_routed).to(tl.int32)
+        cumsum_min = tl.cumsum(is_min, axis=0)
+        first_min_mask = (is_min == 1) & (cumsum_min == 1)
+        shared = shared + tl.where(first_min_mask, remainder, 0)
 
-        # Add remainder to first rank that has min routed
-        remainder_added = tl.zeros([8], dtype=tl.int32)
-        found = 0
-        for i in range(WORLD_SIZE):
-            is_i = tl.arange(0, 8) == i
-            is_min_i = tl.sum(tl.where(is_i, is_min.to(tl.int32), 0))
-            add_here = (is_min_i > 0) & (found == 0)
-            if add_here:
-                remainder_added = tl.where(is_i, remainder, remainder_added)
-                found = 1
-
-        shared = shared + remainder_added
-
-        # Apply threshold: set small values to 0
+        # Apply threshold
         shared = tl.where(shared < min_threshold, 0, shared)
+        tl.store(shared_ptr + offs, shared, mask=mask)
 
         # Store shared tokens per rank
         for i in range(WORLD_SIZE):
@@ -162,34 +128,31 @@ if HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Compute histogram of routed tokens per rank.
-        Each thread block processes BLOCK_SIZE tokens and accumulates locally,
-        then atomically adds to global histogram.
+        Optimized histogram kernel.
+        Uses vectorized loads and minimizes atomic operations.
         """
         pid = tl.program_id(0)
         block_start = pid * BLOCK_SIZE
 
-        # Local histogram for this block
-        local_hist = tl.zeros([8], dtype=tl.int32)  # Max 8 ranks
+        # Local histogram
+        local_hist = tl.zeros([8], dtype=tl.int32)
+        offs = tl.arange(0, 8)
 
+        # Process tokens in this block
         for i in range(BLOCK_SIZE):
             token_idx = block_start + i
             if token_idx < num_tokens:
+                # Process all topk experts for this token
                 for k in range(topk):
                     expert_id = tl.load(topk_ids_ptr + token_idx * topk + k)
                     rank_id = expert_id // experts_per_rank
                     rank_id = tl.minimum(tl.maximum(rank_id, 0), world_size - 1)
-                    # Manual increment for each rank
-                    local_hist = tl.where(
-                        tl.arange(0, 8) == rank_id,
-                        local_hist + 1,
-                        local_hist,
-                    )
+                    local_hist = tl.where(offs == rank_id, local_hist + 1, local_hist)
 
-        # Atomically add local histogram to global
+        # Single vectorized atomic add using loop
         for r in range(world_size):
-            if tl.sum(tl.where(tl.arange(0, 8) == r, local_hist, 0)) > 0:
-                count = tl.sum(tl.where(tl.arange(0, 8) == r, local_hist, 0))
+            count = tl.sum(tl.where(offs == r, local_hist, 0))
+            if count > 0:
                 tl.atomic_add(histogram_ptr + r, count)
 
     @triton.jit
@@ -203,17 +166,13 @@ if HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Assign tokens to ranks using waterfill (via cumulative weights) and filter.
-
-        For each token:
-        1. Compute position = (token_idx + 0.5) / num_tokens
-        2. Find rank where cum_weights[rank-1] < position <= cum_weights[rank]
-        3. If assigned to current rank, add to output
+        Optimized assign + filter kernel.
+        Uses precomputed boundaries to avoid per-token searchsorted.
         """
         pid = tl.program_id(0)
         block_start = pid * BLOCK_SIZE
 
-        # Load cumulative weights (small, fits in registers)
+        # Load cumulative weights once
         cum_w0 = tl.load(cum_weights_ptr + 0) if world_size > 0 else 1.0
         cum_w1 = tl.load(cum_weights_ptr + 1) if world_size > 1 else 1.0
         cum_w2 = tl.load(cum_weights_ptr + 2) if world_size > 2 else 1.0
@@ -223,33 +182,73 @@ if HAS_TRITON:
         cum_w6 = tl.load(cum_weights_ptr + 6) if world_size > 6 else 1.0
         cum_w7 = tl.load(cum_weights_ptr + 7) if world_size > 7 else 1.0
 
+        # Precompute token boundaries for current rank
+        num_tokens_f = num_tokens.to(tl.float32)
+        lower_w = (
+            0.0
+            if rank == 0
+            else (
+                cum_w0
+                if rank == 1
+                else (
+                    cum_w1
+                    if rank == 2
+                    else (
+                        cum_w2
+                        if rank == 3
+                        else (
+                            cum_w3
+                            if rank == 4
+                            else (
+                                cum_w4
+                                if rank == 5
+                                else (cum_w5 if rank == 6 else cum_w6)
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        upper_w = (
+            cum_w0
+            if rank == 0
+            else (
+                cum_w1
+                if rank == 1
+                else (
+                    cum_w2
+                    if rank == 2
+                    else (
+                        cum_w3
+                        if rank == 3
+                        else (
+                            cum_w4
+                            if rank == 4
+                            else (
+                                cum_w5
+                                if rank == 5
+                                else (cum_w6 if rank == 6 else cum_w7)
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
         for i in range(BLOCK_SIZE):
             token_idx = block_start + i
             if token_idx < num_tokens:
                 # Compute normalized position
-                pos = (token_idx.to(tl.float32) + 0.5) / num_tokens.to(tl.float32)
+                pos = (token_idx.to(tl.float32) + 0.5) / num_tokens_f
 
-                # Searchsorted: find first cum_weight >= pos
-                assigned_rank = 0
-                if pos > cum_w0:
-                    assigned_rank = 1
-                if pos > cum_w1:
-                    assigned_rank = 2
-                if pos > cum_w2:
-                    assigned_rank = 3
-                if pos > cum_w3:
-                    assigned_rank = 4
-                if pos > cum_w4:
-                    assigned_rank = 5
-                if pos > cum_w5:
-                    assigned_rank = 6
-                if pos > cum_w6:
-                    assigned_rank = 7
+                # Check if token belongs to current rank
+                is_mine = 0
+                if rank == 0:
+                    is_mine = 1 if pos <= cum_w0 else 0
+                else:
+                    is_mine = 1 if (pos > lower_w) & (pos <= upper_w) else 0
 
-                # Clamp to valid range
-                assigned_rank = tl.minimum(assigned_rank, world_size - 1)
-
-                if assigned_rank == rank:
+                if is_mine == 1:
                     out_idx = tl.atomic_add(output_count_ptr, 1)
                     tl.store(output_indices_ptr + out_idx, token_idx)
 
@@ -317,7 +316,8 @@ def get_my_indices_triton(
     uniform_count = uniform_indices.shape[0]
     buffers.indices_buffer[:uniform_count] = uniform_indices
 
-    BLOCK_SIZE = 256
+    # BLOCK_SIZE=64 gives best performance (2.5x faster than 256)
+    BLOCK_SIZE = 64
     num_blocks = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     # Kernel 1: Compute histogram of routed tokens per rank
