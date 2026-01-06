@@ -128,8 +128,8 @@ if HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Optimized histogram kernel.
-        Uses vectorized loads and minimizes atomic operations.
+        Optimized histogram kernel v3.
+        Uses vectorized operations with tl.where.
         """
         pid = tl.program_id(0)
         block_start = pid * BLOCK_SIZE
@@ -138,19 +138,18 @@ if HAS_TRITON:
         local_hist = tl.zeros([8], dtype=tl.int32)
         offs = tl.arange(0, 8)
 
-        # Process tokens in this block
+        # Process tokens
         for i in range(BLOCK_SIZE):
             token_idx = block_start + i
             if token_idx < num_tokens:
-                # Process all topk experts for this token
+                base_ptr = topk_ids_ptr + token_idx * topk
                 for k in range(topk):
-                    expert_id = tl.load(topk_ids_ptr + token_idx * topk + k)
+                    expert_id = tl.load(base_ptr + k)
                     rank_id = expert_id // experts_per_rank
-                    rank_id = tl.minimum(tl.maximum(rank_id, 0), world_size - 1)
                     local_hist = tl.where(offs == rank_id, local_hist + 1, local_hist)
 
-        # Single vectorized atomic add using loop
-        for r in range(world_size):
+        # Atomic adds
+        for r in range(8):
             count = tl.sum(tl.where(offs == r, local_hist, 0))
             if count > 0:
                 tl.atomic_add(histogram_ptr + r, count)
@@ -166,13 +165,69 @@ if HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Optimized assign + filter kernel.
-        Uses precomputed boundaries to avoid per-token searchsorted.
+        Optimized assign + filter kernel v3.
+        Computes token range and writes indices using vectorized stores.
         """
+        pid = tl.program_id(0)
+
+        # Load cumulative weights once (vectorized)
+        offs = tl.arange(0, 8)
+        cum_w = tl.load(cum_weights_ptr + offs, mask=offs < world_size, other=1.0)
+
+        # Get bounds for this rank efficiently
+        num_tokens_f = num_tokens.to(tl.float32)
+        lower_w = 0.0 if rank == 0 else tl.sum(tl.where(offs == rank - 1, cum_w, 0.0))
+        upper_w = tl.sum(tl.where(offs == rank, cum_w, 0.0))
+
+        # Compute token range
+        start_token = tl.maximum(tl.math.floor(lower_w * num_tokens_f + 0.5), 0.0).to(
+            tl.int32
+        )
+        end_token = tl.minimum(
+            tl.math.floor(upper_w * num_tokens_f + 0.5), num_tokens_f
+        ).to(tl.int32)
+        if rank == 0:
+            start_token = 0
+
+        count = end_token - start_token
+
+        # Vectorized write - process BLOCK_SIZE indices at a time
+        block_offs = tl.arange(0, BLOCK_SIZE)
+        num_full_blocks = count // BLOCK_SIZE
+        remainder = count % BLOCK_SIZE
+
+        # Write full blocks
+        for b in range(num_full_blocks):
+            write_offs = b * BLOCK_SIZE + block_offs
+            indices = (start_token + write_offs).to(tl.int64)
+            tl.store(output_indices_ptr + write_offs, indices)
+
+        # Write remainder
+        if remainder > 0:
+            write_offs = num_full_blocks * BLOCK_SIZE + block_offs
+            indices = (start_token + write_offs).to(tl.int64)
+            mask = block_offs < remainder
+            tl.store(output_indices_ptr + write_offs, indices, mask=mask)
+
+        # Store count (only from block 0)
+        if pid == 0:
+            tl.store(output_count_ptr, count)
+
+    # Keep old kernel signature for compatibility but redirect to optimized version
+    @triton.jit
+    def _waterfill_assign_filter_kernel_old(
+        cum_weights_ptr,
+        output_indices_ptr,
+        output_count_ptr,
+        num_tokens,
+        world_size: tl.constexpr,
+        rank: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Old kernel kept for reference."""
         pid = tl.program_id(0)
         block_start = pid * BLOCK_SIZE
 
-        # Load cumulative weights once
         cum_w0 = tl.load(cum_weights_ptr + 0) if world_size > 0 else 1.0
         cum_w1 = tl.load(cum_weights_ptr + 1) if world_size > 1 else 1.0
         cum_w2 = tl.load(cum_weights_ptr + 2) if world_size > 2 else 1.0
@@ -182,7 +237,6 @@ if HAS_TRITON:
         cum_w6 = tl.load(cum_weights_ptr + 6) if world_size > 6 else 1.0
         cum_w7 = tl.load(cum_weights_ptr + 7) if world_size > 7 else 1.0
 
-        # Precompute token boundaries for current rank
         num_tokens_f = num_tokens.to(tl.float32)
         lower_w = (
             0.0
@@ -359,8 +413,9 @@ def get_my_indices_triton(
             f"zeros={zeros} small(<10)={small} min_shared={min_shared} max_total={max_total}"
         )
 
-    # Kernel 2: Assign tokens based on cumulative weights + filter
-    _waterfill_assign_filter_kernel[(num_blocks,)](
+    # Kernel 3: Assign tokens based on cumulative weights + filter
+    # New optimized kernel only needs 1 block - computes range directly
+    _waterfill_assign_filter_kernel[(1,)](
         buffers.cum_weights,
         buffers.indices_buffer,
         buffers.count,
