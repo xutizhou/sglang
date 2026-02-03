@@ -27,7 +27,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
-DEFAULT_TIMEOUT = 600
+DEFAULT_TIMEOUT = 1800  # Increased for DeepGEMM JIT warmup
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
@@ -354,8 +354,15 @@ def run_one_case(
     parallel_batch: bool = False,
     cache_hit_rate: float = BenchArgs.cache_hit_rate,
 ):
-    response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
+    # Retry flush_cache with backoff in case warmup requests are still pending
+    for attempt in range(5):
+        response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 200:
+            break
+        if response.status_code == 400 and attempt < 4:
+            time.sleep(2)  # Wait for pending requests to complete
+            continue
+        response.raise_for_status()
 
     # Load input token ids
     # TODO: reuse bench_serving.get_dataset ?

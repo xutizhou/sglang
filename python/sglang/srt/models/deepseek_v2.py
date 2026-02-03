@@ -754,6 +754,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -762,10 +763,19 @@ class DeepseekV2MoE(nn.Module):
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
 
+        # Check if we should use the optimized overlap path for deepep
+        # This moves shared expert launch after dispatch_a (quant) to allow better overlap
+        use_deepep_overlap = (
+            not sbo_enabled_flag
+            and self._enable_a2a_moe
+            and self.alt_stream is not None
+        )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag:
+            if not sbo_enabled_flag and not use_deepep_overlap:
+                # Original path: launch shared expert right after gate
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -790,7 +800,17 @@ class DeepseekV2MoE(nn.Module):
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                nonlocal shared_event
+
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
+
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -932,6 +952,29 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif use_deepep_overlap:
+            # Optimized path for deepep: launch shared expert after dispatch_a (quant)
+            # This allows gate/topk/quant to complete first, then shared expert overlaps with
+            # get_dispatch_layout/notify_dispatch/dispatch
+
+            def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                nonlocal shared_event
+
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output.record_stream(self.alt_stream)
+                    shared_event = self.alt_stream.record_event()
+
+                for handle in deepep_dispatch_hook_handle:
+                    handle.remove()
+
+            deepep_dispatch_hook_handle = (
+                self.experts.dispatcher.register_deepep_dispatch_hook(
+                    _deepep_dispatch_hook
+                )
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -940,8 +983,9 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             hidden_states.shape[0] > 0
-            and not sbo_enabled_flag
+            and (not sbo_enabled_flag or sbo_overlap_dispatch_flag or use_deepep_overlap)
             and self.alt_stream is not None
+            and shared_event is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
