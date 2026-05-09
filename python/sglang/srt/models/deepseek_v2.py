@@ -949,11 +949,16 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
+                forward_batch=forward_batch,
                 **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+            if (
+                is_deepep_class_backend()
+                and self.num_fused_shared_experts > 0
+                and not getattr(self.topk, "enable_deepep_waterfill", False)
+            ):
                 n = self.num_fused_shared_experts
                 topk_output = topk_output._replace(
                     topk_ids=topk_output.topk_ids.new_empty(

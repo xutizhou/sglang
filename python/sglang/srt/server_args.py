@@ -621,6 +621,7 @@ class ServerArgs:
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
     elastic_ep_rejoin: bool = False
+    enable_deepep_waterfill: bool = False
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -3094,6 +3095,13 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -3102,6 +3110,18 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            if self.enable_deepep_waterfill:
+                if self.disable_shared_experts_fusion:
+                    logger.warning(
+                        "disable_shared_experts_fusion is overridden to False because "
+                        "DeepEP Waterfill requires shared expert fusion."
+                    )
+                    self.disable_shared_experts_fusion = False
+                self.enforce_shared_experts_fusion = True
+                logger.info(
+                    "DeepEP Waterfill is enabled. Shared expert will be dispatched "
+                    "through DeepEP for load balancing."
+                )
 
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size
@@ -5820,6 +5840,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.deepep_config,
             help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+        )
+        parser.add_argument(
+            "--enable-deepep-waterfill",
+            action="store_true",
+            default=ServerArgs.enable_deepep_waterfill,
+            help=(
+                "Enable DeepEP Waterfill for fused shared experts. It dispatches "
+                "the shared expert as an extra MoE slot to a lightly loaded EP rank "
+                "and automatically sets --moe-a2a-backend deepep with shared-expert "
+                "fusion enforced."
+            ),
         )
         parser.add_argument(
             "--moe-dense-tp-size",
