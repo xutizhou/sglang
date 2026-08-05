@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
@@ -15,6 +16,17 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
+
+
+@dataclass(frozen=True)
+class ExpertReplicaStorage:
+    """Semantic view of the tensors required to execute replicated experts."""
+
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_weight_scale: Optional[torch.Tensor] = None
+    w2_weight_scale: Optional[torch.Tensor] = None
+    auxiliary_tensors: tuple[tuple[str, torch.Tensor], ...] = ()
 
 
 class QuantizeMethodBase(ABC):
@@ -120,6 +132,60 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement get_triton_quant_info()"
+        )
+
+    def get_expert_replica_storage(
+        self, layer: torch.nn.Module
+    ) -> ExpertReplicaStorage:
+        """Return the expert state that a dynamic replication policy must move.
+
+        Quantization methods remain the source of truth for their weight and
+        scale tensors. The default implementation reuses their existing
+        semantic ``TritonMoeQuantInfo`` instead of inspecting layer attribute
+        names. Methods with a different representation can override this
+        method directly.
+        """
+
+        quant_info = self.get_triton_quant_info(layer)
+        num_local_experts = layer.num_local_experts
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+        w13_weight_scale = getattr(quant_info, "w13_scale", None)
+        w2_weight_scale = getattr(quant_info, "w2_scale", None)
+        declared = tuple(
+            tensor
+            for tensor in (w13_weight, w2_weight, w13_weight_scale, w2_weight_scale)
+            if isinstance(tensor, torch.Tensor)
+        )
+
+        auxiliary_tensors = {}
+        for name in ("b13", "b2", "w13_zp", "w2_zp"):
+            tensor = getattr(quant_info, name, None)
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.ndim > 0
+                and tensor.shape[0] == num_local_experts
+            ):
+                auxiliary_tensors[name] = tensor
+
+        named_tensors = getattr(layer, "named_per_expert_tensors", None)
+        if named_tensors is not None:
+            for name, tensor in named_tensors(num_local_experts):
+                if not any(
+                    tensor.shape == known.shape
+                    and tensor.dtype == known.dtype
+                    and tensor.device == known.device
+                    and tensor.data_ptr() == known.data_ptr()
+                    for known in declared
+                ):
+                    auxiliary_tensors[name] = tensor
+
+        return ExpertReplicaStorage(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_scale=w13_weight_scale,
+            w2_weight_scale=w2_weight_scale,
+            auxiliary_tensors=tuple(sorted(auxiliary_tensors.items())),
         )
 
 

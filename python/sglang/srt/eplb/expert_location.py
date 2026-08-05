@@ -130,6 +130,36 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
+    def init_ultraep(
+        server_args: ServerArgs, model_config: ModelConfig, moe_ep_rank: int
+    ):
+        """Initialize UltraEP's fixed-master, per-rank replica-slot layout."""
+        from moe_load_balancer.policies.l3 import (
+            build_ultraep_physical_to_logical_map,
+        )
+
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        if common is None:
+            return None
+        model_location = common["model_config_for_expert_location"]
+        physical_to_logical_map = build_ultraep_physical_to_logical_map(
+            num_layers=model_location.num_layers,
+            num_logical_experts=model_location.num_logical_experts,
+            ep_size=common["ep_size"],
+            num_redundant_experts_per_rank=(
+                server_args.ultraep_num_redundant_experts_per_rank
+            ),
+            device=server_args.device,
+        )
+        assert physical_to_logical_map.shape[1] == common["num_physical_experts"]
+        return ExpertLocationMetadata.init_by_mapping(
+            server_args,
+            model_config,
+            physical_to_logical_map=physical_to_logical_map,
+            moe_ep_rank=moe_ep_rank,
+        )
+
+    @staticmethod
     def init_by_mapping(
         server_args: ServerArgs,
         model_config: ModelConfig,
@@ -765,6 +795,10 @@ def compute_initial_expert_location_metadata(
     model_config: ModelConfig,
     moe_ep_rank: int,
 ) -> Optional[ExpertLocationMetadata]:
+    if server_args.enable_ultraep:
+        return ExpertLocationMetadata.init_ultraep(
+            server_args, model_config, moe_ep_rank
+        )
     data = server_args.init_expert_location
     if data == "trivial":
         return ExpertLocationMetadata.init_trivial(

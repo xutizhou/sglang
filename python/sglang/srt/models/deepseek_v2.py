@@ -815,6 +815,8 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
+        # ModelRunner injects this after all expert weights are finalized.
+        self.moe_load_balancer = None
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
@@ -1231,7 +1233,7 @@ class DeepseekV2MoE(nn.Module):
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     )
-                    if not self.is_nextn
+                    if not self.is_nextn and self.moe_load_balancer is None
                     else None
                 ),
                 **topk_kwargs,
@@ -1239,6 +1241,23 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
+            )
+
+        # Every EP rank, including ranks with zero tokens, must enter UltraEP's
+        # collective placement/synchronization sequence in the same order.
+        if self.moe_load_balancer is not None:
+            from moe_load_balancer import L3Request
+
+            decision = self.moe_load_balancer.rebalance_runtime(
+                L3Request(
+                    layer_id=self.layer_id,
+                    logical_topk_ids=topk_output.topk_ids,
+                    topk_weights=topk_output.topk_weights,
+                )
+            )
+            topk_output = topk_output._replace(
+                topk_ids=decision.routed_physical_topk_ids,
+                topk_weights=decision.topk_weights,
             )
 
         if sbo_overlap_dispatch_flag:

@@ -240,6 +240,43 @@ To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase
 
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 
+### Experimental MLB L3 Policy: UltraEP
+
+SGLang can optionally create one `MoELoadBalancer` and configure UltraEP as its
+L3 runtime-rebalancing policy. The layer hot path calls only the MLB
+orchestrator; the L3 policy owns UltraEP's CUDA/NVSHMEM backend. Unlike periodic
+EPLB, this policy uses the exact post-gating load to create transient replicas
+and reroute the current layer. The first integration is an inference POC for
+DeepSeek-family models on SM90/SM100 with DeepEP and NVSHMEM.
+
+Install UltraEP's pinned `nvidia-nvshmem-cu13==3.4.5` dependency (use the cu12
+package for CUDA 12.x), then build MLB inside the SGLang environment with
+`MLB_BUILD_ULTRAEP=1` and `--no-build-isolation`. Launch an EP8 process with
+two replica slots per rank using:
+
+```bash
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3 \
+  --tp 8 --ep 8 \
+  --moe-a2a-backend deepep \
+  --enable-ultraep \
+  --ultraep-num-redundant-experts-per-rank 2
+```
+
+The POC deliberately rejects EPLB/LPLB, non-trivial initial placement,
+Waterfill shared-expert fusion, expert recording, PP, TBO, DWDP, elastic EP,
+and additional per-expert tensors it cannot synchronize. CUDA graph is disabled
+until mutable replica-weight capture is validated. UltraEP currently copies its
+NVSHMEM replica rows into SGLang's contiguous FusedMoE rows before dispatch;
+this extra device copy is a known performance limitation of the initial
+integration.
+
+Quantized experts are registered through the quantization method's semantic
+replica-storage view rather than by inspecting SGLang parameter names. Weight
+plus paired per-expert scale layouts are supported. Quantization methods that
+require additional per-expert biases or zero-points fail validation instead of
+creating incomplete replicas.
+
 
 ## Ascend NPU Guidance
 ### Guidance on SGLang configuration in Ascend NPU

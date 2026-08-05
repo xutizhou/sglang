@@ -421,6 +421,7 @@ class TopK(MultiPlatformOp):
         self.layer_id = layer_id
         from sglang.srt.runtime_context import get_server_args
 
+        self.enable_ultraep = get_server_args().enable_ultraep
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
@@ -430,6 +431,10 @@ class TopK(MultiPlatformOp):
             # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
+            output_format = TopKOutputFormat.STANDARD
+        if self.enable_ultraep:
+            # UltraEP consumes explicit logical TopK IDs and replaces them with
+            # transient physical IDs immediately before DeepEP dispatch.
             output_format = TopKOutputFormat.STANDARD
 
         # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod

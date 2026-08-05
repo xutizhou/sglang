@@ -2241,6 +2241,16 @@ class ServerArgs:
         "Allocate this number of redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = 0
+    enable_ultraep: A[
+        bool,
+        "Enable UltraEP as MLB's experimental L3 policy for DeepEP inference.",
+        NS("exec.moe"),
+    ] = False
+    ultraep_num_redundant_experts_per_rank: A[
+        int,
+        "Number of transient UltraEP replica slots reserved on every EP rank.",
+        NS("exec.moe"),
+    ] = 0
     ep_dispatch_algorithm: A[
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
@@ -6382,6 +6392,64 @@ class ServerArgs:
         return self.chunked_prefill_size
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_ultraep:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            view = resolved_view(self)
+            ep_size = view.ep_size
+            if ep_size <= 1:
+                raise ValueError("--enable-ultraep requires EP size greater than one.")
+            if view.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--enable-ultraep currently requires --moe-a2a-backend deepep."
+                )
+            if self.ultraep_num_redundant_experts_per_rank <= 0:
+                raise ValueError(
+                    "--enable-ultraep requires "
+                    "--ultraep-num-redundant-experts-per-rank > 0."
+                )
+            if self.enable_eplb or self.ep_dispatch_algorithm is not None:
+                raise ValueError(
+                    "UltraEP owns routed-expert placement for this POC and cannot be "
+                    "combined with EPLB or an EP dispatch algorithm."
+                )
+            if self.init_expert_location != "trivial":
+                raise ValueError(
+                    "UltraEP currently requires --init-expert-location trivial."
+                )
+            if self.enable_waterfill:
+                raise ValueError(
+                    "UltraEP currently requires Waterfill/shared-expert fusion to be disabled."
+                )
+            if self.expert_distribution_recorder_mode is not None:
+                raise ValueError(
+                    "UltraEP currently does not support SGLang's expert distribution recorder."
+                )
+            if self.dwdp_size > 1:
+                raise ValueError("UltraEP currently cannot be combined with DWDP.")
+            if self.pp_size > 1 or self.enable_two_batch_overlap:
+                raise ValueError(
+                    "UltraEP currently requires PP size 1 and two-batch overlap disabled."
+                )
+            if self.elastic_ep_backend is not None:
+                raise ValueError("UltraEP currently does not support elastic EP.")
+
+            expected_redundant = self.ultraep_num_redundant_experts_per_rank * ep_size
+            if self.ep_num_redundant_experts not in (0, expected_redundant):
+                raise ValueError(
+                    "--ep-num-redundant-experts must be omitted or equal "
+                    f"{expected_redundant} for the requested UltraEP layout."
+                )
+            self.ep_num_redundant_experts = expected_redundant
+            self.disable_shared_experts_fusion = True
+            self.enforce_shared_experts_fusion = False
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "UltraEP POC is enabled: routed EPLB/LPLB, expert recording, "
+                "Waterfill shared fusion, and CUDA graph are disabled."
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
