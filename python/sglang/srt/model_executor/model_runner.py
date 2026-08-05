@@ -136,6 +136,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prepare_moe_load_balancer,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -613,6 +614,13 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        # Register final expert-weight pointers only after post-load transforms
+        # and LoRA setup have had a chance to replace or wrap model parameters.
+        self.moe_load_balancer = prepare_moe_load_balancer(
+            model=self.model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 

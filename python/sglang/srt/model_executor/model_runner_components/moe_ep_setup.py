@@ -74,6 +74,117 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
+def prepare_moe_load_balancer(
+    *, model, model_config: ModelConfig, server_args: ServerArgs
+):
+    """Create one MLB orchestrator with UltraEP configured as its L3 policy."""
+
+    if not server_args.enable_ultraep:
+        return None
+
+    try:
+        from moe_load_balancer import (
+            ExpertLayerStorage,
+            ExpertProjectionStorage,
+            MoELoadBalancer,
+        )
+        from moe_load_balancer.policies.l3 import UltraEPL3Policy
+    except ImportError as exc:
+        raise ImportError(
+            "--enable-ultraep requires moe-load-balancer installed with its "
+            "UltraEP backend extension (MLB_BUILD_ULTRAEP=1)."
+        ) from exc
+
+    num_logical_experts = getattr(model_config.hf_config, "n_routed_experts", None)
+    if num_logical_experts is None:
+        raise ValueError(
+            "UltraEP POC currently supports DeepSeek-style n_routed_experts."
+        )
+
+    layer_specs = []
+    moe_modules = []
+    for module in model.modules():
+        if not (
+            hasattr(module, "forward_deepep")
+            and hasattr(module, "experts")
+            and hasattr(module, "layer_id")
+        ):
+            continue
+        if getattr(module, "num_fused_shared_experts", 0) != 0:
+            raise ValueError(
+                "UltraEP POC requires shared-expert fusion to be disabled."
+            )
+        experts = module.experts
+        assert experts.quant_method is not None
+        try:
+            replica_storage = experts.quant_method.get_expert_replica_storage(experts)
+        except NotImplementedError as exc:
+            raise ValueError(
+                "UltraEP does not support expert replication for quantization method "
+                f"{type(experts.quant_method).__name__}."
+            ) from exc
+        if replica_storage.auxiliary_tensors:
+            unsupported = [name for name, _ in replica_storage.auxiliary_tensors]
+            raise ValueError(
+                "UltraEP does not yet synchronize these per-expert quantization "
+                f"tensors: {unsupported}."
+            )
+        for projection, weight, scale in (
+            ("fc1", replica_storage.w13_weight, replica_storage.w13_weight_scale),
+            ("fc2", replica_storage.w2_weight, replica_storage.w2_weight_scale),
+        ):
+            if weight.element_size() == 1 and scale is None:
+                raise ValueError(
+                    f"Low-precision UltraEP {projection} weights require per-expert scales."
+                )
+        layer_specs.append(
+            ExpertLayerStorage(
+                layer_id=module.layer_id,
+                fc1=ExpertProjectionStorage(
+                    weight=replica_storage.w13_weight.detach(),
+                    weight_scale=(
+                        replica_storage.w13_weight_scale.detach()
+                        if replica_storage.w13_weight_scale is not None
+                        else None
+                    ),
+                ),
+                fc2=ExpertProjectionStorage(
+                    weight=replica_storage.w2_weight.detach(),
+                    weight_scale=(
+                        replica_storage.w2_weight_scale.detach()
+                        if replica_storage.w2_weight_scale is not None
+                        else None
+                    ),
+                ),
+            )
+        )
+        moe_modules.append(module)
+
+    if not layer_specs:
+        raise ValueError("UltraEP did not find any compatible DeepEP MoE layers.")
+
+    from sglang.srt.distributed import get_moe_ep_group
+
+    ep_group = get_moe_ep_group()
+    ultraep_policy = UltraEPL3Policy(
+        group=ep_group.device_group,
+        layers=layer_specs,
+        num_logical_experts=num_logical_experts,
+        ep_size=ep_group.world_size,
+        num_redundant_experts_per_rank=(
+            server_args.ultraep_num_redundant_experts_per_rank
+        ),
+    )
+    load_balancer = MoELoadBalancer(l3_policy=ultraep_policy)
+    for module in moe_modules:
+        module.moe_load_balancer = load_balancer
+    log_info_on_rank0(
+        logger,
+        f"Prepared one MoELoadBalancer with UltraEP L3 for {len(moe_modules)} MoE layers.",
+    )
+    return load_balancer
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.distributed import get_moe_ep_group
