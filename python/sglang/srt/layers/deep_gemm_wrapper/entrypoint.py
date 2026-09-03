@@ -47,6 +47,7 @@ if ENABLE_JIT_DEEPGEMM:
             return sf
         return out
 
+
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
@@ -144,7 +145,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
 ):
-    m, k = lhs[0].shape
+    m, storage_k = lhs[0].shape
+    # Packed E2M1 stores two logical K values per byte. Use logical K for
+    # DeepGEMM precompile/cache bookkeeping as well as the runtime call.
+    k = storage_k * 2 if lhs[0].dtype in (torch.int8, torch.uint8) else storage_k
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 

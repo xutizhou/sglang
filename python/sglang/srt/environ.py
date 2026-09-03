@@ -1041,6 +1041,10 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    # Opt-in DeepSeek-V4 SM120 routed-MoE activation precision. Expert weights
+    # remain the checkpoint's packed MXFP4 tensors.
+    SGLANG_DEEPGEMM_G1_W4A4 = EnvBool(False)
+    SGLANG_DEEPGEMM_G2_W4A4 = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================

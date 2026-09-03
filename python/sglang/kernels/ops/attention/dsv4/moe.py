@@ -17,6 +17,17 @@ _is_xpu = is_xpu()
 
 
 @cache_once
+def _jit_mxfp8_to_mxfp4_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("mxfp8_to_mxfp4"),
+        *args,
+        cuda_files=["deepseek_v4/mxfp8_to_mxfp4.cuh"],
+        cuda_wrappers=[("run", f"Mxfp8ToMxfp4Kernel<{args}>::run")],
+    )
+
+
+@cache_once
 def _jit_mask_topk_module():
     return load_jit(
         make_name("mask_topk"),
@@ -105,6 +116,22 @@ def _jit_silu_mul_quant_contig_module(
 
 
 @cache_once
+def _jit_silu_mul_quant_fp4_contig_module(apply_swiglu_limit: bool):
+    args = make_cpp_args(
+        32,
+        is_arch_support_pdl(),
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        make_name("silu_mul_quant_fp4_contig"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulContigFp4PostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -182,7 +209,6 @@ def mega_moe_pre_dispatch(
         buf_topk_idx,
         buf_topk_weights,
     )
-
 
 
 def mega_moe_pre_dispatch_sm90(
@@ -271,3 +297,36 @@ def silu_and_mul_contig_post_quant(
         transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )
+
+
+def silu_and_mul_contig_fp4_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
+) -> None:
+    """Fuse clamp-SwiGLU with MXFP4 E2M1/UE8M0 quantization."""
+    apply_swiglu_limit = swiglu_limit is not None
+    module = _jit_silu_mul_quant_fp4_contig_module(apply_swiglu_limit)
+    module.run(
+        input,
+        output,
+        output_scale,
+        float(swiglu_limit) if apply_swiglu_limit else 0.0,
+    )
+
+
+def mxfp8_to_mxfp4(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """Directly requantize DeepEP MXFP8 to packed MXFP4 without BF16."""
+    if input.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"MXFP8 input must be E4M3FN, got {input.dtype}")
+    if input_scale.dtype != torch.int32:
+        raise ValueError(f"MXFP8 scale must be packed int32, got {input_scale.dtype}")
+    if output.dtype != torch.int8 or output_scale.dtype != torch.int32:
+        raise ValueError("MXFP4 output must be packed int8 values and int32 scales")
+    _jit_mxfp8_to_mxfp4_module().run(input, input_scale, output, output_scale)
