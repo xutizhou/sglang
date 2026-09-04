@@ -552,9 +552,8 @@ struct SiluMulQuantContigFp4Params {
 };
 
 template <bool kUsePDL, bool kApplySwigluLimit>
-__global__ __launch_bounds__(256, 6) void
-    silu_mul_quant_contig_fp4_kernel(
-        const SiluMulQuantContigFp4Params __grid_constant__ params) {
+__global__ __launch_bounds__(256, 6) void silu_mul_quant_contig_fp4_kernel(
+    const SiluMulQuantContigFp4Params __grid_constant__ params) {
   using namespace device;
 
   constexpr uint32_t kGroupSize = 32u;
@@ -568,17 +567,14 @@ __global__ __launch_bounds__(256, 6) void
   const auto active = thread_id < num_threads;
   const auto work_id = thread_id / kWorkThreads;
   const auto input = params.input + token_id * params.hidden_dim * 2;
-  auto output = reinterpret_cast<uint8_t*>(params.output) +
-                token_id * (params.hidden_dim / 2);
+  auto output = reinterpret_cast<uint8_t*>(params.output) + token_id * (params.hidden_dim / 2);
 
   // Physical scale storage is (G//4, M_pad) int32 and the exposed tensor is
   // its (M, G//4) column-major view. Each int32 packs four consecutive UE8M0
   // scale bytes for one token.
   auto scale_bytes = reinterpret_cast<uint8_t*>(params.output_scale);
   auto output_scale =
-      scale_bytes +
-      (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u +
-      (work_id % 4u);
+      scale_bytes + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -597,8 +593,7 @@ __global__ __launch_bounds__(256, 6) void
   if (active) {
 #pragma unroll
     for (uint32_t i = 0; i < kValuesPerThread / 2; ++i) {
-      const auto [x, y] = silu_and_mul<kApplySwigluLimit>(
-          gate_vec[i], up_vec[i], params.swiglu_limit);
+      const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
       results[2 * i + 0] = x;
       results[2 * i + 1] = y;
       local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -608,10 +603,7 @@ __global__ __launch_bounds__(256, 6) void
   local_max = warp::reduce_max<kWorkThreads>(local_max);
   // Match FlashInfer/OCP MXFP4's canonical all-zero-group encoding. UE8M0
   // byte 0 represents 2^-127 and still dequantizes zero E2M1 values to zero.
-  const auto scale_ue8m0 = local_max == 0.0f
-                               ? uint8_t{0}
-                               : static_cast<uint8_t>(
-                                     cast_to_ue8m0(local_max / 6.0f));
+  const auto scale_ue8m0 = local_max == 0.0f ? uint8_t{0} : static_cast<uint8_t>(cast_to_ue8m0(local_max / 6.0f));
   const float inv_scale = inv_scale_ue8m0(scale_ue8m0);
 
   float scaled[kValuesPerThread];
@@ -658,13 +650,13 @@ __global__ __launch_bounds__(256, 6) void
 template <int64_t kGroupSize, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulContigFp4PostQuantKernel {
   static_assert(kGroupSize == 32);
-  static constexpr auto kernel =
-      silu_mul_quant_contig_fp4_kernel<kUsePDL, kApplySwigluLimit>;
+  static constexpr auto kernel = silu_mul_quant_contig_fp4_kernel<kUsePDL, kApplySwigluLimit>;
 
-  static void run(const tvm::ffi::TensorView input,
-                  const tvm::ffi::TensorView output,
-                  const tvm::ffi::TensorView output_scale,
-                  const double swiglu_limit) {
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const double swiglu_limit) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -675,14 +667,8 @@ struct SiluAndMulContigFp4PostQuantKernel {
     auto M_pad = SymbolicSize{"M padded"};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M, D})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(input);
-    TensorMatcher({M, P})
-        .with_dtype<int8_t>()
-        .with_device(device)
-        .verify(output);
+    TensorMatcher({M, D}).with_dtype<bf16_t>().with_device(device).verify(input);
+    TensorMatcher({M, P}).with_dtype<int8_t>().with_device(device).verify(output);
     TensorMatcher({M, G4})
         .with_strides({int64_t{1}, M_pad})
         .with_dtype<int32_t>()
@@ -690,21 +676,16 @@ struct SiluAndMulContigFp4PostQuantKernel {
         .verify(output_scale);
 
     const auto hidden_dim = P.unwrap() * 2;
-    RuntimeCheck(D.unwrap() == hidden_dim * 2,
-                 "input last dim must be 2 * logical output dim");
-    RuntimeCheck(hidden_dim % 128 == 0,
-                 "MXFP4 TMA scale packing requires hidden_dim % 128 == 0");
-    RuntimeCheck(G4.unwrap() * 4 * kGroupSize == hidden_dim,
-                 "invalid packed scale shape");
-    RuntimeCheck(M_pad.unwrap() >= M.unwrap(),
-                 "invalid TMA-aligned scale stride");
+    RuntimeCheck(D.unwrap() == hidden_dim * 2, "input last dim must be 2 * logical output dim");
+    RuntimeCheck(hidden_dim % 128 == 0, "MXFP4 TMA scale packing requires hidden_dim % 128 == 0");
+    RuntimeCheck(G4.unwrap() * 4 * kGroupSize == hidden_dim, "invalid packed scale shape");
+    RuntimeCheck(M_pad.unwrap() >= M.unwrap(), "invalid TMA-aligned scale stride");
     constexpr int64_t kValuesPerThread = 8;
     constexpr int64_t kMaxThreads = 256;
     const auto num_work_threads = hidden_dim / kValuesPerThread;
     const auto block_threads = std::min(num_work_threads, kMaxThreads);
     const auto num_tiles = (num_work_threads + block_threads - 1) / block_threads;
-    RuntimeCheck(block_threads % device::kWarpThreads == 0,
-                 "launch must contain complete warps");
+    RuntimeCheck(block_threads % device::kWarpThreads == 0, "launch must contain complete warps");
 
     const auto params = SiluMulQuantContigFp4Params{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
@@ -715,13 +696,9 @@ struct SiluAndMulContigFp4PostQuantKernel {
         .scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap()),
     };
     LaunchKernel(
-        dim3(static_cast<uint32_t>(M.unwrap()),
-             static_cast<uint32_t>(num_tiles)),
-        block_threads,
-        device.unwrap())
+        dim3(static_cast<uint32_t>(M.unwrap()), static_cast<uint32_t>(num_tiles)), block_threads, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
-
 
 }  // namespace sglang

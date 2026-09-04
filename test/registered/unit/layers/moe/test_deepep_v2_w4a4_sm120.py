@@ -34,6 +34,7 @@ def test_deepep_v2_prefill_uses_g1_and_g2_w4a4(monkeypatch) -> None:
 
     from deep_gemm.testing import calc_diff
     from deep_gemm.utils import cast_back_from_fp4
+
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )

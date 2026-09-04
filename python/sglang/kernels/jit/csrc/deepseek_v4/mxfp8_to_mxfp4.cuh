@@ -21,10 +21,8 @@ __forceinline__ __device__ float fp8_e4m3_to_float(uint8_t bits) {
   const uint32_t sign = bits >> 7u;
   const uint32_t exponent = (bits >> 3u) & 0xfu;
   const uint32_t mantissa = bits & 0x7u;
-  float value = exponent == 0u
-                    ? static_cast<float>(mantissa) * 0.001953125f
-                    : __uint_as_float(((exponent + 120u) << 23u) |
-                                      (mantissa << 20u));
+  float value = exponent == 0u ? static_cast<float>(mantissa) * 0.001953125f
+                               : __uint_as_float(((exponent + 120u) << 23u) | (mantissa << 20u));
   return sign == 0u ? value : -value;
 }
 
@@ -42,10 +40,8 @@ __forceinline__ __device__ uint32_t ceil_to_ue8m0(float raw_scale) {
 // rounding toward zero rather than cvt.e2m1 round-to-even behavior.
 __forceinline__ __device__ uint32_t fp4_e2m1_encode(float value) {
   float magnitude = min(fabsf(value), 6.0f);
-  uint32_t code = (magnitude > 0.25f) + (magnitude > 0.75f) +
-                  (magnitude > 1.25f) + (magnitude > 1.75f) +
-                  (magnitude > 2.5f) + (magnitude > 3.5f) +
-                  (magnitude > 5.0f);
+  uint32_t code = (magnitude > 0.25f) + (magnitude > 0.75f) + (magnitude > 1.25f) + (magnitude > 1.75f) +
+                  (magnitude > 2.5f) + (magnitude > 3.5f) + (magnitude > 5.0f);
   if (value < 0.0f && code != 0u) {
     code |= 0x8u;
   }
@@ -56,16 +52,14 @@ __forceinline__ __device__ uint32_t fp4_e2m1_encode(float value) {
 // adjacent values; four adjacent threads form one 32-value MXFP4 scale group.
 // The output layouts match ep_scatter's FP4 input contract.
 template <bool kUsePDL>
-__global__ __launch_bounds__(1024, 1) void mxfp8_to_mxfp4_kernel(
-    const Mxfp8ToMxfp4Params __grid_constant__ params) {
+__global__ __launch_bounds__(1024, 1) void mxfp8_to_mxfp4_kernel(const Mxfp8ToMxfp4Params __grid_constant__ params) {
   using namespace device;
 
   const uint32_t token = blockIdx.x;
   const uint32_t tid = threadIdx.x;
   PDLWaitPrimary<kUsePDL>();
 
-  const auto* row_in =
-      params.input + static_cast<uint64_t>(token) * params.hidden_size;
+  const auto* row_in = params.input + static_cast<uint64_t>(token) * params.hidden_size;
   float values[8];
   float local_max = 0.0f;
 #pragma unroll
@@ -89,25 +83,19 @@ __global__ __launch_bounds__(1024, 1) void mxfp8_to_mxfp4_kernel(
     const uint32_t hi = fp4_e2m1_encode(values[2u * i + 1u] * inv_scale);
     packed |= ((lo & 0xfu) | ((hi & 0xfu) << 4u)) << (8u * i);
   }
-  params.output[static_cast<uint64_t>(token) * (params.hidden_size / 8u) +
-                tid] = static_cast<int32_t>(packed);
+  params.output[static_cast<uint64_t>(token) * (params.hidden_size / 8u) + tid] = static_cast<int32_t>(packed);
 
   if ((tid & 3u) == 0u) {
     const uint32_t group_32 = tid / 4u;
     const uint32_t group_128 = group_32 / 4u;
-    const auto* input_scale_bytes =
-        reinterpret_cast<const uint8_t*>(params.input_scale);
+    const auto* input_scale_bytes = reinterpret_cast<const uint8_t*>(params.input_scale);
     const uint32_t input_exponent =
-        input_scale_bytes[(group_128 / 4u) * params.input_scale_stride * 4u +
-                          token * 4u + (group_128 & 3u)];
+        input_scale_bytes[(group_128 / 4u) * params.input_scale_stride * 4u + token * 4u + (group_128 & 3u)];
     const int32_t combined =
-        max(0, min(255, static_cast<int32_t>(input_exponent) +
-                            static_cast<int32_t>(fp4_exponent) - 127));
-    auto* output_scale_bytes =
-        reinterpret_cast<uint8_t*>(params.output_scale);
-    output_scale_bytes[static_cast<uint64_t>(token) *
-                           (params.hidden_size / 32u) +
-                       group_32] = static_cast<uint8_t>(combined);
+        max(0, min(255, static_cast<int32_t>(input_exponent) + static_cast<int32_t>(fp4_exponent) - 127));
+    auto* output_scale_bytes = reinterpret_cast<uint8_t*>(params.output_scale);
+    output_scale_bytes[static_cast<uint64_t>(token) * (params.hidden_size / 32u) + group_32] =
+        static_cast<uint8_t>(combined);
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -117,10 +105,11 @@ template <bool kUsePDL>
 struct Mxfp8ToMxfp4Kernel {
   static constexpr auto kernel = mxfp8_to_mxfp4_kernel<kUsePDL>;
 
-  static void run(const tvm::ffi::TensorView input,
-                  const tvm::ffi::TensorView input_scale,
-                  const tvm::ffi::TensorView output,
-                  const tvm::ffi::TensorView output_scale) {
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView input_scale,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -140,27 +129,15 @@ struct Mxfp8ToMxfp4Kernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(input_scale);
-    TensorMatcher({M, K4})
-        .with_dtype<int8_t>()
-        .with_device(device)
-        .verify(output);
-    TensorMatcher({M, G4})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(output_scale);
+    TensorMatcher({M, K4}).with_dtype<int8_t>().with_device(device).verify(output);
+    TensorMatcher({M, G4}).with_dtype<int32_t>().with_device(device).verify(output_scale);
 
-    RuntimeCheck(K.unwrap() % 128 == 0,
-                 "MXFP8 input K must be divisible by 128");
-    RuntimeCheck(K4.unwrap() * 2 == K.unwrap(),
-                 "invalid packed MXFP4 value shape");
-    RuntimeCheck(G8.unwrap() * 512 == K.unwrap(),
-                 "invalid packed MXFP8 scale shape");
-    RuntimeCheck(G4.unwrap() * 128 == K.unwrap(),
-                 "invalid packed MXFP4 scale shape");
-    RuntimeCheck(K.unwrap() / 8 <= 1024,
-                 "MXFP8 to MXFP4 requires K <= 8192");
-    RuntimeCheck(input_stride.unwrap() >= M.unwrap(),
-                 "invalid input TMA-aligned scale stride");
+    RuntimeCheck(K.unwrap() % 128 == 0, "MXFP8 input K must be divisible by 128");
+    RuntimeCheck(K4.unwrap() * 2 == K.unwrap(), "invalid packed MXFP4 value shape");
+    RuntimeCheck(G8.unwrap() * 512 == K.unwrap(), "invalid packed MXFP8 scale shape");
+    RuntimeCheck(G4.unwrap() * 128 == K.unwrap(), "invalid packed MXFP4 scale shape");
+    RuntimeCheck(K.unwrap() / 8 <= 1024, "MXFP8 to MXFP4 requires K <= 8192");
+    RuntimeCheck(input_stride.unwrap() >= M.unwrap(), "invalid input TMA-aligned scale stride");
 
     // A DeepEP rank may legally receive no routed tokens. Avoid an invalid
     // zero-grid launch while retaining the same shape validation contract.
@@ -177,8 +154,7 @@ struct Mxfp8ToMxfp4Kernel {
         .hidden_size = static_cast<uint32_t>(K.unwrap()),
         .input_scale_stride = static_cast<uint32_t>(input_stride.unwrap()),
     };
-    LaunchKernel(M.unwrap(), K.unwrap() / 8, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(M.unwrap(), K.unwrap() / 8, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

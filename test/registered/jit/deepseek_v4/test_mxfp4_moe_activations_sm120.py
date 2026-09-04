@@ -11,7 +11,6 @@ register_cuda_ci(
     stage="base-b-kernel-unit",
     runner_config="1-gpu-large",
 )
-register_cuda_ci(est_time=90, suite="nightly-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(
     not is_sm120_supported(),
@@ -23,6 +22,7 @@ pytestmark = pytest.mark.skipif(
 def test_deepep_mxfp8_to_mxfp4_requantization(num_tokens: int) -> None:
     from deep_gemm.testing import calc_diff
     from deep_gemm.utils import cast_back_from_fp4
+
     from sglang.kernels.ops.attention.dsv4 import mxfp8_to_mxfp4
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -78,6 +78,7 @@ def test_silu_and_mul_contig_fp4_matches_reference(
     from deep_gemm.testing import calc_diff
     from deep_gemm.utils import cast_back_from_fp4
     from deep_gemm.utils.layout import get_tma_aligned_size
+
     from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_fp4_post_quant
 
     torch.manual_seed(20260902)
