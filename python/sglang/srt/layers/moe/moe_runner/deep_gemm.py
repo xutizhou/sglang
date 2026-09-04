@@ -349,6 +349,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             and _is_sm120
             and quant_info.is_fp4_experts
             and self.config.activation == "silu"
+            and running_state.get("deepep_v2_prefill", False)
         )
         if g2_act_fp4 and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             raise RuntimeError(
@@ -1691,6 +1692,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
     deepep_v2_total_expanded = dispatch_output.total_expanded
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
+    running_state["deepep_v2_prefill"] = not is_expanded
     g1_act_fp4 = (
         envs.SGLANG_DEEPGEMM_G1_W4A4.get()
         and _is_sm120
