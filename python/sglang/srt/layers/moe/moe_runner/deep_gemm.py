@@ -231,6 +231,8 @@ class DeepGemmRunnerInput(RunnerInput):
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
     hidden_states_scale_tma_aligned: bool = False
+    # True only for the opt-in SM120 contiguous GEMM1 W4A4 path.
+    g1_act_fp4: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -322,7 +324,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import (
+            silu_and_mul_contig_fp4_post_quant,
+            silu_and_mul_contig_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -339,6 +344,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         scale_block_size = 128
+        g2_act_fp4 = (
+            envs.SGLANG_DEEPGEMM_G2_W4A4.get()
+            and _is_sm120
+            and quant_info.is_fp4_experts
+            and self.config.activation == "silu"
+            and running_state.get("deepep_v2_prefill", False)
+        )
+        if g2_act_fp4 and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            raise RuntimeError(
+                "SGLANG_DEEPGEMM_G2_W4A4 requires packed UE8M0 activation scales"
+            )
 
         if all_tokens == 0:
             dispose_tensor(hidden_states)
@@ -347,9 +363,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 (0, K), device=hidden_states_device, dtype=torch.bfloat16
             )
 
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        if quant_info.is_fp4_experts:
+            recipe_a_g1 = (1, 32) if runner_input.g1_act_fp4 else (1, 128)
+            recipe_a_g2 = (1, 32) if g2_act_fp4 else (1, 128)
+            recipe_b = (1, 32)
+        else:
+            recipe_a_g1 = recipe_a_g2 = recipe_b = None
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -373,14 +392,43 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_fp8,
             gateup_output,
             m_indices,
-            recipe_a=recipe_a,
+            recipe_a=recipe_a_g1,
             recipe_b=recipe_b,
         )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        if g2_act_fp4:
+            from deep_gemm.utils.layout import get_tma_aligned_size
+
+            # Logical G2 K is N/2. E2M1 packs two values per byte, while four
+            # per-32 UE8M0 scales are packed into each int32 column.
+            if N % 256 != 0:
+                raise RuntimeError(
+                    f"fused G2 MXFP4 requires gateup width divisible by 256, got {N}"
+                )
+            down_input_fp8 = torch.empty(
+                (all_tokens, N // 4),
+                device=gateup_output.device,
+                dtype=torch.int8,
+            )
+            packed_scale_cols = N // 256
+            scale_m_padded = get_tma_aligned_size(all_tokens, 4)
+            down_input_scale_storage = torch.empty(
+                (packed_scale_cols, scale_m_padded),
+                device=gateup_output.device,
+                dtype=torch.int32,
+            )
+            down_input_scale = down_input_scale_storage[:, :all_tokens].T
+            silu_and_mul_contig_fp4_post_quant(
+                input=gateup_output,
+                output=down_input_fp8,
+                output_scale=down_input_scale,
+                swiglu_limit=self.swiglu_limit,
+            )
+            del gateup_output
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -506,7 +554,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not g2_act_fp4:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -514,7 +562,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_fp8,
             down_output,
             m_indices,
-            recipe_a=recipe_a,
+            recipe_a=recipe_a_g2,
             recipe_b=recipe_b,
         )
 
@@ -1635,6 +1683,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
     topk_ids = dispatch_output.topk_ids
     topk_weights = dispatch_output.topk_weights
     num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
+    num_valid_tokens_per_expert = num_recv_tokens_per_expert
     psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
     is_expanded = dispatch_output.is_expanded
     hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
@@ -1643,6 +1692,13 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
     deepep_v2_total_expanded = dispatch_output.total_expanded
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
+    running_state["deepep_v2_prefill"] = not is_expanded
+    g1_act_fp4 = (
+        envs.SGLANG_DEEPGEMM_G1_W4A4.get()
+        and _is_sm120
+        and quant_info.is_fp4_experts
+        and not is_expanded
+    )
     if hidden_states_scale is None:
         raise RuntimeError(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
@@ -1651,6 +1707,9 @@ def pre_permute_deepep_v2_to_deep_gemm(
     assert runner_config.activation == "silu"
 
     if is_expanded:
+        # DeepEP v2 selects expanded/masked layout for decode (non-extend)
+        # batches. V06 changes Prefill MoE activations only, so this path keeps
+        # the V05 MXFP8/W4A8 behavior even when the opt-in is enabled.
         if psum_num_recv_tokens_per_expert is None:
             raise RuntimeError(
                 "DeepEP v2 expanded layout requires native expert prefix sums."
@@ -1711,18 +1770,64 @@ def pre_permute_deepep_v2_to_deep_gemm(
         all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
         num_recv_tokens_per_expert_gpu = None
     else:
-        num_recv_tokens_per_expert = [
+        aligned_num_recv_tokens_per_expert = [
             ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
         ]
-        all_tokens = sum(num_recv_tokens_per_expert)
+        all_tokens = sum(aligned_num_recv_tokens_per_expert)
         num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
+            aligned_num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
         ).cuda(non_blocking=True)
+        num_valid_tokens_per_expert_gpu = torch.tensor(
+            num_valid_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
+        ).cuda(non_blocking=True)
+    hidden_states_shape = hidden_states.shape
+    hidden_states_device = hidden_states.device
+    hidden_states_dtype = hidden_states.dtype
     K = hidden_states.shape[1]
+    if g1_act_fp4:
+        if (
+            not hidden_states_scale_tma_aligned
+            or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            raise RuntimeError(
+                "DeepEP v2 G1 W4A4 requires TMA-aligned packed UE8M0 "
+                "MXFP8 dispatch scales"
+            )
+        from sglang.kernels.ops.attention.dsv4 import mxfp8_to_mxfp4
+
+        fp8_hidden_states = hidden_states
+        fp8_hidden_states_scale = hidden_states_scale
+        hidden_states = torch.empty(
+            (fp8_hidden_states.shape[0], K // 2),
+            device=fp8_hidden_states.device,
+            dtype=torch.int8,
+        )
+        hidden_states_scale = torch.empty(
+            (hidden_states.shape[0], K // 128),
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        mxfp8_to_mxfp4(
+            fp8_hidden_states,
+            fp8_hidden_states_scale,
+            hidden_states,
+            hidden_states_scale,
+        )
+        dispose_tensor(fp8_hidden_states)
+        dispose_tensor(fp8_hidden_states_scale)
+        quant_block_size = 64
+    else:
+        quant_block_size = 128
     running_state["all_tokens"] = all_tokens
-    running_state["hidden_states_shape"] = hidden_states.shape
-    running_state["hidden_states_device"] = hidden_states.device
-    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
@@ -1732,9 +1837,15 @@ def pre_permute_deepep_v2_to_deep_gemm(
     # consumed and the activation buffer needs no zero-init. The ue8m0 packed-scale
     # layout keeps zeros (its in-int32 padding lanes must be zero).
     input_tensor = torch.empty(
-        (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
+        (all_tokens, K // 2 if g1_act_fp4 else K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+    if g1_act_fp4:
+        input_tensor_scale = torch.empty(
+            (K // 128, all_tokens), device=hidden_states.device, dtype=torch.int32
+        ).transpose(0, 1)
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
@@ -1766,7 +1877,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
             input_tensor_scale,
             m_indices,
             output_index,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not g1_act_fp4),
+            quant_block_size=quant_block_size,
         )
     else:
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
@@ -1775,12 +1887,14 @@ def pre_permute_deepep_v2_to_deep_gemm(
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
+            num_valid_tokens_per_expert_gpu,
             expert_start_loc,
             input_tensor,
             input_tensor_scale,
             m_indices,
             output_index,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not g1_act_fp4),
+            quant_block_size=quant_block_size,
         )
     dispose_tensor(hidden_states)
     dispose_tensor(hidden_states_scale)
@@ -1791,6 +1905,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
+        hidden_states_scale_tma_aligned=g1_act_fp4,
+        g1_act_fp4=g1_act_fp4,
     )
 
 

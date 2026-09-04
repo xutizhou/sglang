@@ -29,7 +29,9 @@ from .moe import (
     mask_topk_ids,
     mega_moe_pre_dispatch,
     mega_moe_pre_dispatch_sm90,
+    mxfp8_to_mxfp4,
     silu_and_mul_clamp,
+    silu_and_mul_contig_fp4_post_quant,
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
 )
@@ -62,7 +64,9 @@ __all__ = [
     "mega_moe_pre_dispatch",
     "mega_moe_pre_dispatch_sm90",
     "mask_topk_ids",
+    "mxfp8_to_mxfp4",
     "silu_and_mul_clamp",
     "silu_and_mul_masked_post_quant",
+    "silu_and_mul_contig_fp4_post_quant",
     "silu_and_mul_contig_post_quant",
 ]

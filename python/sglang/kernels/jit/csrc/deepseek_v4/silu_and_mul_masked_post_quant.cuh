@@ -17,6 +17,7 @@
 namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
+using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
 struct SiluMulQuantVarlenParams {
@@ -533,6 +534,169 @@ struct SiluAndMulContigPostQuantKernel {
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+// Fused DSV4 clamp + SwiGLU + MXFP4 quantization for the contiguous G2
+// activation. This streaming kernel has no reusable data: each thread reads
+// eight gate and eight up BF16 values, computes the activations, and writes
+// packed E2M1 bytes. Four adjacent threads form one 32-value scale group.
+struct SiluMulQuantContigFp4Params {
+  const bf16_t* __restrict__ input;
+  int8_t* __restrict__ output;
+  int32_t* __restrict__ output_scale;
+  float swiglu_limit;  // only read when kApplySwigluLimit=true
+  int64_t hidden_dim;
+  uint32_t scale_row_stride_int32;
+};
+
+template <bool kUsePDL, bool kApplySwigluLimit>
+__global__ __launch_bounds__(256, 6) void silu_mul_quant_contig_fp4_kernel(
+    const SiluMulQuantContigFp4Params __grid_constant__ params) {
+  using namespace device;
+
+  constexpr uint32_t kGroupSize = 32u;
+  constexpr uint32_t kValuesPerThread = 8u;
+  constexpr uint32_t kWorkThreads = kGroupSize / kValuesPerThread;
+  using InputVec = AlignedVector<bf16x2_t, kValuesPerThread / 2>;
+
+  const auto token_id = blockIdx.x;
+  const auto thread_id = blockIdx.y * blockDim.x + threadIdx.x;
+  const auto num_threads = params.hidden_dim / kValuesPerThread;
+  const auto active = thread_id < num_threads;
+  const auto work_id = thread_id / kWorkThreads;
+  const auto input = params.input + token_id * params.hidden_dim * 2;
+  auto output = reinterpret_cast<uint8_t*>(params.output) + token_id * (params.hidden_dim / 2);
+
+  // Physical scale storage is (G//4, M_pad) int32 and the exposed tensor is
+  // its (M, G//4) column-major view. Each int32 packs four consecutive UE8M0
+  // scale bytes for one token.
+  auto scale_bytes = reinterpret_cast<uint8_t*>(params.output_scale);
+  auto output_scale =
+      scale_bytes + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
+
+  PDLWaitPrimary<kUsePDL>();
+
+  InputVec gate_vec, up_vec;
+  if (active) {
+    gate_vec.load(input, thread_id);
+    up_vec.load(input, thread_id + num_threads);
+  }
+
+  float local_max = 0.0f;
+  float results[kValuesPerThread];
+#pragma unroll
+  for (uint32_t i = 0; i < kValuesPerThread; ++i) {
+    results[i] = 0.0f;
+  }
+  if (active) {
+#pragma unroll
+    for (uint32_t i = 0; i < kValuesPerThread / 2; ++i) {
+      const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+      results[2 * i + 0] = x;
+      results[2 * i + 1] = y;
+      local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
+  }
+
+  local_max = warp::reduce_max<kWorkThreads>(local_max);
+  // Match FlashInfer/OCP MXFP4's canonical all-zero-group encoding. UE8M0
+  // byte 0 represents 2^-127 and still dequantizes zero E2M1 values to zero.
+  const auto scale_ue8m0 = local_max == 0.0f ? uint8_t{0} : static_cast<uint8_t>(cast_to_ue8m0(local_max / 6.0f));
+  const float inv_scale = inv_scale_ue8m0(scale_ue8m0);
+
+  float scaled[kValuesPerThread];
+#pragma unroll
+  for (uint32_t i = 0; i < kValuesPerThread; ++i) {
+    scaled[i] = results[i] * inv_scale;
+  }
+
+  // SM120 has native round-to-nearest E2M1 conversion. Packing in one inline
+  // PTX block lets ptxas emit F2FP instead of scalar threshold comparisons.
+  uint32_t packed;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(packed)
+      : "f"(scaled[0]),
+        "f"(scaled[1]),
+        "f"(scaled[2]),
+        "f"(scaled[3]),
+        "f"(scaled[4]),
+        "f"(scaled[5]),
+        "f"(scaled[6]),
+        "f"(scaled[7]));
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  if (active) {
+    reinterpret_cast<uint32_t*>(output)[thread_id] = packed;
+  }
+  if (active && (thread_id % kWorkThreads) == 0) {
+    *output_scale = scale_ue8m0;
+  }
+}
+
+template <int64_t kGroupSize, bool kUsePDL, bool kApplySwigluLimit>
+struct SiluAndMulContigFp4PostQuantKernel {
+  static_assert(kGroupSize == 32);
+  static constexpr auto kernel = silu_mul_quant_contig_fp4_kernel<kUsePDL, kApplySwigluLimit>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const double swiglu_limit) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    auto D = SymbolicSize{"gate_up_dim"};
+    auto P = SymbolicSize{"packed_hidden_dim"};
+    auto G4 = SymbolicSize{"packed_scale_groups"};
+    auto M_pad = SymbolicSize{"M padded"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, D}).with_dtype<bf16_t>().with_device(device).verify(input);
+    TensorMatcher({M, P}).with_dtype<int8_t>().with_device(device).verify(output);
+    TensorMatcher({M, G4})
+        .with_strides({int64_t{1}, M_pad})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(output_scale);
+
+    const auto hidden_dim = P.unwrap() * 2;
+    RuntimeCheck(D.unwrap() == hidden_dim * 2, "input last dim must be 2 * logical output dim");
+    RuntimeCheck(hidden_dim % 128 == 0, "MXFP4 TMA scale packing requires hidden_dim % 128 == 0");
+    RuntimeCheck(G4.unwrap() * 4 * kGroupSize == hidden_dim, "invalid packed scale shape");
+    RuntimeCheck(M_pad.unwrap() >= M.unwrap(), "invalid TMA-aligned scale stride");
+    constexpr int64_t kValuesPerThread = 8;
+    constexpr int64_t kMaxThreads = 256;
+    const auto num_work_threads = hidden_dim / kValuesPerThread;
+    const auto block_threads = std::min(num_work_threads, kMaxThreads);
+    const auto num_tiles = (num_work_threads + block_threads - 1) / block_threads;
+    RuntimeCheck(block_threads % device::kWarpThreads == 0, "launch must contain complete warps");
+
+    const auto params = SiluMulQuantContigFp4Params{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<int8_t*>(output.data_ptr()),
+        .output_scale = static_cast<int32_t*>(output_scale.data_ptr()),
+        .swiglu_limit = static_cast<float>(swiglu_limit),
+        .hidden_dim = hidden_dim,
+        .scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap()),
+    };
+    LaunchKernel(
+        dim3(static_cast<uint32_t>(M.unwrap()), static_cast<uint32_t>(num_tiles)), block_threads, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };

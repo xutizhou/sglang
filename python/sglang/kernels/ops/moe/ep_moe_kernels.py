@@ -1259,9 +1259,10 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_block_size: int = 128,
 ):
     BLOCK_E = 128
-    BLOCK_D = 128
+    BLOCK_D = quant_block_size
     num_warps = 8
     num_experts = psum_num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
@@ -1675,8 +1676,12 @@ def fill_gateup_input_triton_kernel(
 
 @triton.jit
 def _per_token_group_quant_fp8_pow2_kernel(
-    x_ptr, out_ptr, scale_ptr,
-    M, K, group_size: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    M,
+    K,
+    group_size: tl.constexpr,
     fp8_max: tl.constexpr,
     BLOCK_GROUP: tl.constexpr,
 ):
@@ -1711,7 +1716,14 @@ def _per_token_group_quant_fp8_pow2(x, group_size):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     grid = (M, num_groups)
     _per_token_group_quant_fp8_pow2_kernel[grid](
-        x, x_q, x_s, M, K, group_size, fp8_max, BLOCK_GROUP=group_size,
+        x,
+        x_q,
+        x_s,
+        M,
+        K,
+        group_size,
+        fp8_max,
+        BLOCK_GROUP=group_size,
     )
     return x_q, x_s
 
