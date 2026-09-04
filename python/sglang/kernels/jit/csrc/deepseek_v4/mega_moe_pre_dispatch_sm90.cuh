@@ -29,7 +29,7 @@
 // Quant main-loop (vector load + absmax + pack_fp8 store) is intentionally
 // kept inline in this file to avoid coupling with the SM100 template.
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::pack_fp8;
 
@@ -244,4 +244,4 @@ struct MegaMoEPreDispatchSM90Kernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

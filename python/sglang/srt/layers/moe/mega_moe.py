@@ -87,6 +87,9 @@ _MEGA_MOE_ARCH_CONFIGS = {
 }
 
 
+MEGA_MOE_SUPPORTED_SM = (90, 100)
+
+
 def _select_mega_moe_arch_config(
     w13: torch.Tensor, w2: torch.Tensor
 ) -> Optional[_MegaMoeArchConfig]:
@@ -97,8 +100,7 @@ def _select_mega_moe_arch_config(
     ):
         return _SM90_FP8_CONFIG
     if (
-        _device_sm is not None
-        and _device_sm >= 100
+        _device_sm == 100
         and w13.dtype == torch.int8
         and w2.dtype == torch.int8
     ):
