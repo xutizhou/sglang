@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_SM120_ROUTED_MOE_STATE: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 
 
@@ -57,6 +58,7 @@ class _MegaMoeArchConfig:
     uses_raw_fp32_scales: bool
     use_dp_max_tokens: bool
     fold_routed_scaling_in_pre_dispatch: bool
+    uses_sm120_routed_api: bool = False
 
 
 _SM90_FP8_CONFIG = _MegaMoeArchConfig(
@@ -94,13 +96,29 @@ _SM90_MXFP4_CONFIG = _MegaMoeArchConfig(
     use_dp_max_tokens=True,
     fold_routed_scaling_in_pre_dispatch=True,
 )
+_SM120_FP8_FP4_CONFIG = _MegaMoeArchConfig(
+    name="sm120_fp8_fp4",
+    deep_gemm_entry="fp8_fp4_routed_moe_sm120",
+    run_recipe=(1, 1, 32),
+    scale_recipe=(1, 32),
+    pre_dispatch_group_size=32,
+    fp4_weight_packed=True,
+    uses_raw_fp32_scales=False,
+    use_dp_max_tokens=True,
+    fold_routed_scaling_in_pre_dispatch=False,
+    uses_sm120_routed_api=True,
+)
 _MEGA_MOE_ARCH_CONFIGS = {
     config.name: config
-    for config in (_SM90_FP8_CONFIG, _SM100_FP8_FP4_CONFIG, _SM90_MXFP4_CONFIG)
+    for config in (
+        _SM90_FP8_CONFIG,
+        _SM90_MXFP4_CONFIG,
+        _SM100_FP8_FP4_CONFIG,
+        _SM120_FP8_FP4_CONFIG,
+    )
 }
 
-
-MEGA_MOE_SUPPORTED_SM = (90, 100)
+MEGA_MOE_SUPPORTED_SM = (90, 100, 120)
 
 
 def _select_mega_moe_arch_config(
@@ -124,6 +142,12 @@ def _select_mega_moe_arch_config(
         and w2.dtype == torch.int8
     ):
         return _SM90_MXFP4_CONFIG
+    if (
+        _device_sm == 120
+        and w13.dtype == torch.int8
+        and w2.dtype == torch.int8
+    ):
+        return _SM120_FP8_FP4_CONFIG
     return None
 
 
@@ -232,7 +256,40 @@ def _deep_gemm_supports_mega_moe_config(config: _MegaMoeArchConfig) -> bool:
         import deep_gemm
     except ImportError:
         return False
-    return hasattr(deep_gemm, config.deep_gemm_entry)
+    if not hasattr(deep_gemm, config.deep_gemm_entry):
+        return False
+    if config.uses_sm120_routed_api:
+        has_api = all(
+            hasattr(deep_gemm, name)
+            for name in ("SM120RoutedMoESession", "SM120RoutedMoEWorkspace")
+        )
+        has_kernel = getattr(
+            getattr(deep_gemm, "_C", None),
+            "has_sm120_routed_moe",
+            lambda: False,
+        )
+        return has_api and has_kernel()
+    return True
+
+
+def _get_sm120_routed_moe_state(group):
+    import deep_gemm
+
+    device = torch.cuda.current_device()
+    world_size = group.size()
+    key = (id(group), device, world_size)
+    state = _SM120_ROUTED_MOE_STATE.get(key)
+    if state is None:
+        # Materialize the torch NCCL communicator consumed by DeepGEMM GIN.
+        torch.distributed.barrier(group=group, device_ids=[device])
+        session = deep_gemm.SM120RoutedMoESession(group, device)
+        workspace = deep_gemm.SM120RoutedMoEWorkspace(
+            device=device,
+            world_size=world_size,
+        )
+        state = (session, workspace)
+        _SM120_ROUTED_MOE_STATE[key] = state
+    return state
 
 
 def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> int:
@@ -268,6 +325,13 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     config = _get_built_mega_moe_arch_config(moe.experts)
     if config is None or not _deep_gemm_supports_mega_moe_config(config):
         return False
+    if config.uses_sm120_routed_api:
+        if hidden_states.shape[0] > 8192:
+            raise ValueError(
+                "SM120 MegaMoE supports at most 8192 tokens per rank, got "
+                f"{hidden_states.shape[0]}"
+            )
+        return True
     is_capture_mode = get_is_capture_mode()
     max_tokens_per_rank = _get_effective_num_tokens(config, hidden_states.shape[0])
     if is_capture_mode:
@@ -330,7 +394,8 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
     effective_num_tokens = _get_effective_num_tokens(config, num_tokens)
     if config.use_dp_max_tokens and effective_num_tokens == 0:
-        _ensure_mega_moe_symm_buffer(moe)
+        if not config.uses_sm120_routed_api:
+            _ensure_mega_moe_symm_buffer(moe)
         return hidden_states.new_empty((0, hidden_size))
 
     if num_tokens > 0:
@@ -357,6 +422,15 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+
+    if config.uses_sm120_routed_api:
+        return _run_sm120_routed(
+            moe,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            effective_num_tokens,
+        )
 
     moe_ep_group = get_moe_ep_group()
     ep_group = moe_ep_group.device_group
@@ -507,6 +581,83 @@ def _run_mega_routed(
     return y
 
 
+def _run_sm120_routed(
+    moe: "DeepseekV2MoE",
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    effective_num_tokens: int,
+) -> torch.Tensor:
+    import deep_gemm
+
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8_ue8m0,
+    )
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    num_tokens, hidden_size = hidden_states.shape
+    top_k = moe.config.num_experts_per_tok
+    if not num_tokens <= effective_num_tokens <= 8192:
+        raise ValueError(
+            "SM120 MegaMoE effective token count must be in "
+            f"[{num_tokens}, 8192], got {effective_num_tokens}"
+        )
+
+    if effective_num_tokens == num_tokens:
+        assert topk_ids is not None and topk_weights is not None
+        launch_hidden_states = hidden_states
+        launch_topk_ids = topk_ids.to(dtype=torch.int64).contiguous()
+        launch_topk_weights = topk_weights.to(dtype=torch.float32).contiguous()
+    else:
+        launch_hidden_states = hidden_states.new_zeros(
+            (effective_num_tokens, hidden_size)
+        )
+        launch_topk_ids = torch.full(
+            (effective_num_tokens, top_k),
+            -1,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        launch_topk_weights = torch.zeros(
+            (effective_num_tokens, top_k),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        launch_hidden_states[:num_tokens].copy_(hidden_states)
+        if num_tokens > 0:
+            assert topk_ids is not None and topk_weights is not None
+            launch_topk_ids[:num_tokens].copy_(topk_ids.to(dtype=torch.int64))
+            launch_topk_weights[:num_tokens].copy_(
+                topk_weights.to(dtype=torch.float32)
+            )
+
+    x, x_scales = sglang_per_token_group_quant_fp8_ue8m0(
+        launch_hidden_states.contiguous(),
+        group_size=32,
+    )
+    ep_group = get_moe_ep_group().device_group
+    session, workspace = _get_sm120_routed_moe_state(ep_group)
+    # Align DP ranks before the collective GIN launch.
+    torch.distributed.barrier(
+        group=ep_group,
+        device_ids=[hidden_states.device.index],
+    )
+    torch.cuda.synchronize(hidden_states.device)
+    y = deep_gemm.fp8_fp4_routed_moe_sm120(
+        session,
+        workspace,
+        x.contiguous(),
+        x_scales.contiguous(),
+        launch_topk_ids,
+        launch_topk_weights,
+        moe.experts.mega_l1_weights,
+        moe.experts.mega_l2_weights,
+    )[:num_tokens]
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        y.mul_(moe.routed_scaling_factor)
+    return y
+
+
 def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Tensor:
     num_groups, n, *rest = weight.shape
     half = n // 2
@@ -515,6 +666,36 @@ def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Ten
     return torch.empty_like(weight).copy_(
         torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
     )
+
+
+def _transform_sm120_weight_scales(
+    scales: torch.Tensor,
+    *,
+    mn: int,
+    k: int,
+    num_groups: int,
+    interleave_gate_up: bool = False,
+) -> torch.Tensor:
+    from deep_gemm import transform_sf_into_required_layout
+
+    if interleave_gate_up:
+        scales = _interleave_l1_weight_only(scales)
+    transformed = transform_sf_into_required_layout(
+        scales.contiguous(),
+        mn=mn,
+        k=k,
+        recipe=(1, 32),
+        num_groups=num_groups,
+        disable_ue8m0_cast=False,
+    )
+    transformed = transformed.transpose(-1, -2).contiguous()
+    expected_shape = (num_groups, k // 128, mn)
+    if tuple(transformed.shape) != expected_shape:
+        raise RuntimeError(
+            "DeepGEMM returned an incompatible SM120 weight-scale layout: "
+            f"got {tuple(transformed.shape)}, expected {expected_shape}"
+        )
+    return transformed
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
@@ -613,6 +794,18 @@ def build_mega_moe_experts_weights(experts) -> bool:
     k1 = half_k1 * k_factor
     k2 = half_k2 * k_factor
 
+    if config.uses_sm120_routed_api and (
+        num_groups not in (32, 64)
+        or (n1, k1) != (4096, 4096)
+        or (n2, k2) != (4096, 2048)
+    ):
+        raise ValueError(
+            "SM120 MegaMoE requires the DeepSeek-V4 routed-expert layout "
+            "(EP4/EP8, W1=[local_experts,4096,4096], "
+            "W2=[local_experts,4096,2048]); got "
+            f"W1=[{num_groups},{n1},{k1}], W2=[{num_groups},{n2},{k2}]"
+        )
+
     scale_group_mn, scale_group_k = config.scale_recipe
     assert k1 % scale_group_k == 0 and k2 % scale_group_k == 0, (
         f"invalid mega-moe K/group_size: k1={k1}, k2={k2}, "
@@ -640,7 +833,39 @@ def build_mega_moe_experts_weights(experts) -> bool:
     )
 
     fix_mega_moe_memory = envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get()
-    if fix_mega_moe_memory and config.name == _SM90_FP8_CONFIG.name:
+    if config.uses_sm120_routed_api:
+        if not _deep_gemm_supports_mega_moe_config(config):
+            raise RuntimeError(
+                "SM120 MegaMoE requires a DeepGEMM build with the routed-MoE API"
+            )
+        w13_interleaved = _interleave_l1_weight_only(w13)
+        w13_sf = _transform_sm120_weight_scales(
+            w13_sf_fp32,
+            mn=n1,
+            k=k1,
+            num_groups=num_groups,
+            interleave_gate_up=True,
+        )
+        w2_sf = _transform_sm120_weight_scales(
+            w2_sf_fp32,
+            mn=n2,
+            k=k2,
+            num_groups=num_groups,
+        )
+        experts.w13_weight.data = w13_interleaved
+        experts.w13_weight_scale_inv.data = w13_sf
+        experts.w2_weight_scale_inv.data = w2_sf
+        experts.w13_weight_scale_inv.format_ue8m0 = True
+        experts.w2_weight_scale_inv.format_ue8m0 = True
+        experts.mega_l1_weights = (
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+        )
+        experts.mega_l2_weights = (
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+        )
+    elif fix_mega_moe_memory and config.name == _SM90_FP8_CONFIG.name:
         # SM90 shares both fp8 weights and block-(128, 128) FP32 scales with the
         # DeepEP grouped-GEMM path. SM90 has no UTCCP scale transpose, and its
         # scale tensors stay in checkpoint layout.
