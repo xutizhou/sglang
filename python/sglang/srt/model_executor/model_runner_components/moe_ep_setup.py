@@ -12,7 +12,11 @@ from sglang.srt.eplb.lplb_solver import (
     set_global_lplb_solver,
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    fused_shared_expert_weight,
+    is_routed_scaling_factor_fused_in_topk,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
@@ -50,22 +54,36 @@ def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
         num_physical_routed_experts = (
             num_routed_experts + get_exec().moe.ep_num_redundant_experts
         )
+        # The shared slot's weight depends on where routed_scaling_factor is
+        # applied: 1/rsf when DeepseekV2MoE's epilogue scales the combined MoE
+        # output afterwards, 1.0 when the router already folded it into the
+        # routed weights (should_fuse_routed_scaling_factor_in_topk quant
+        # methods, aiter routes) and that epilogue multiply is skipped.
         if isinstance(module, TopK):
             routed_scaling_factor = module.topk_config.routed_scaling_factor
+            fused_in_topk = is_routed_scaling_factor_fused_in_topk(module.topk_config)
         else:
             routed_scaling_factor = module.routed_scaling_factor
+            fused_in_topk = bool(module.apply_routed_scaling_factor_on_output)
+        shared_weight = fused_shared_expert_weight(
+            routed_scaling_factor=routed_scaling_factor,
+            fused_in_topk=fused_in_topk,
+        )
         module.waterfill_balancer = balancer_cls(
             num_routed_experts=num_physical_routed_experts,
             world_size=parallel.moe_ep_size,
             rank=parallel.moe_ep_rank,
             layer_id=module.layer_id,
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            shared_weight=shared_weight,
         )
         num_prepared += 1
     if num_prepared:
-        log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
+        log_info_on_rank0(
+            logger,
+            f"Prepared {num_prepared} Waterfill TopK modules "
+            f"(shared_weight={shared_weight:.4f}, "
+            f"routed_scaling_factor_fused_in_topk={fused_in_topk}).",
+        )
 
 
 def prebuild_deepep_v2_buffer(*, model) -> None:

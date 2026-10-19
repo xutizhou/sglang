@@ -11,6 +11,11 @@ These tests pin the fused shared expert's topk weight contract on three paths:
   * standard EP path (no per-rank slots): every rank computes the fused shared
     expert and the outputs are all-reduced, so the model-supplied 1/ep_size
     factor must be applied to the shared weight.
+  * Waterfill: the shared slot appended by WaterfillBalancer follows the same
+    rule as the per-rank slot -- 1/rsf when the MoE epilogue scales the output
+    afterwards, 1.0 when the router already folded routed_scaling_factor into
+    the routed weights (should_fuse_routed_scaling_factor_in_topk quant
+    methods such as ModelOpt NVFP4 on flashinfer_cutedsl, aiter routes).
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +30,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
+from sglang.srt.model_executor.model_runner_components import moe_ep_setup
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -188,6 +195,151 @@ class TestFusedSharedExpertScaling(CustomTestCase):
 
         self.assertEqual(output.topk_ids.shape, (0, 8))
         self.assertEqual(output.topk_weights.shape, (0, 8))
+
+
+class TestWaterfillSharedWeight(CustomTestCase):
+    """WaterfillBalancer's shared slot must count the shared expert exactly
+    once, whichever side of the experts routed_scaling_factor is applied on."""
+
+    ROUTED_SCALING_FACTOR = 2.5
+    NUM_ROUTED_EXPERTS = 256
+    EP_SIZE = 8
+
+    def _make_topk(self, **config_kwargs) -> TopK:
+        topk = TopK.__new__(TopK)
+        torch.nn.Module.__init__(topk)
+        topk.layer_id = 3
+        topk.enable_waterfill = True
+        topk.waterfill_balancer = None
+        topk.topk_config = TopKConfig(
+            top_k=8,
+            num_fused_shared_experts=0,
+            routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+            **config_kwargs,
+        )
+        return topk
+
+    def _make_hash_topk(self, *, apply_routed_scaling_factor_on_output) -> HashTopK:
+        topk = HashTopK.__new__(HashTopK)
+        torch.nn.Module.__init__(topk)
+        topk.layer_id = 3
+        topk.enable_waterfill = True
+        topk.waterfill_balancer = None
+        topk.routed_scaling_factor = self.ROUTED_SCALING_FACTOR
+        topk.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
+        return topk
+
+    def _prepare(self, module, *, use_aiter=False):
+        model = torch.nn.Module()
+        model.topk = module
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(n_routed_experts=self.NUM_ROUTED_EXPERTS)
+        )
+        with (
+            patch.object(topk_module, "_use_aiter", use_aiter),
+            patch.object(
+                moe_ep_setup,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=self.EP_SIZE, moe_ep_rank=1),
+            ),
+            patch.object(
+                moe_ep_setup,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(ep_num_redundant_experts=0)
+                ),
+            ),
+        ):
+            moe_ep_setup.prepare_moe_topk(model=model, model_config=model_config)
+        self.assertIsNotNone(module.waterfill_balancer)
+        self.assertEqual(
+            module.waterfill_balancer.num_routed_experts, self.NUM_ROUTED_EXPERTS
+        )
+        return module.waterfill_balancer.shared_weight
+
+    def test_post_moe_scaling_uses_inverse_rsf(self):
+        # Default CUDA path (e.g. FP8 + DeepEP + deep_gemm): forward_deepep
+        # multiplies the combined MoE output by rsf afterwards, so the shared
+        # slot must carry 1/rsf.
+        topk = self._make_topk(use_grouped_topk=True, correction_bias=torch.zeros(1))
+        self.assertAlmostEqual(self._prepare(topk), 1.0 / self.ROUTED_SCALING_FACTOR)
+
+    def test_folded_rsf_uses_unit_weight(self):
+        # should_fuse_routed_scaling_factor_in_topk quant methods (ModelOpt
+        # NVFP4 on flashinfer_cutedsl, cutlass / trtllm-routed FP8): the routed
+        # weights already carry rsf and the epilogue multiply is skipped, so a
+        # 1/rsf shared slot would shrink the shared expert to 0.4x.
+        topk = self._make_topk(
+            use_grouped_topk=True,
+            correction_bias=torch.zeros(1),
+            apply_routed_scaling_factor_on_output=True,
+        )
+        self.assertAlmostEqual(self._prepare(topk), 1.0)
+
+    def test_aiter_biased_grouped_routing_uses_unit_weight(self):
+        # aiter_biased_grouped_topk folds rsf regardless of the flag and
+        # forward_deepep skips the multiply on aiter.
+        topk = self._make_topk(use_grouped_topk=True, correction_bias=torch.zeros(1))
+        self.assertAlmostEqual(self._prepare(topk, use_aiter=True), 1.0)
+
+    def test_aiter_unbiased_grouped_routing_keeps_inverse_rsf(self):
+        # Grouped routing without a correction bias does not fold on aiter.
+        topk = self._make_topk(use_grouped_topk=True, correction_bias=None)
+        self.assertAlmostEqual(
+            self._prepare(topk, use_aiter=True), 1.0 / self.ROUTED_SCALING_FACTOR
+        )
+
+    def test_hash_topk_follows_its_own_fold_flag(self):
+        self.assertAlmostEqual(
+            self._prepare(
+                self._make_hash_topk(apply_routed_scaling_factor_on_output=False)
+            ),
+            1.0 / self.ROUTED_SCALING_FACTOR,
+        )
+        self.assertAlmostEqual(
+            self._prepare(
+                self._make_hash_topk(apply_routed_scaling_factor_on_output=True)
+            ),
+            1.0,
+        )
+
+    def test_redundant_experts_extend_physical_count(self):
+        topk = self._make_topk(use_grouped_topk=True, correction_bias=torch.zeros(1))
+        model = torch.nn.Module()
+        model.topk = topk
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(n_routed_experts=self.NUM_ROUTED_EXPERTS)
+        )
+        with (
+            patch.object(topk_module, "_use_aiter", False),
+            patch.object(
+                moe_ep_setup,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=self.EP_SIZE, moe_ep_rank=1),
+            ),
+            patch.object(
+                moe_ep_setup,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(ep_num_redundant_experts=32)
+                ),
+            ),
+        ):
+            moe_ep_setup.prepare_moe_topk(model=model, model_config=model_config)
+        self.assertEqual(
+            topk.waterfill_balancer.num_routed_experts, self.NUM_ROUTED_EXPERTS + 32
+        )
+        self.assertEqual(topk.waterfill_balancer.old_experts_per_rank, 36)
+
+    def test_fused_shared_expert_weight_helper(self):
+        fw = topk_module.fused_shared_expert_weight
+        self.assertAlmostEqual(fw(routed_scaling_factor=2.5, fused_in_topk=False), 0.4)
+        self.assertAlmostEqual(fw(routed_scaling_factor=2.5, fused_in_topk=True), 1.0)
+        # No factor at all: nothing to compensate for on either path.
+        self.assertAlmostEqual(fw(routed_scaling_factor=None, fused_in_topk=False), 1.0)
+        self.assertAlmostEqual(fw(routed_scaling_factor=0.0, fused_in_topk=False), 1.0)
 
 
 if __name__ == "__main__":

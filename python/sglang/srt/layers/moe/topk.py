@@ -2208,6 +2208,47 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
+def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
+    """Whether the routed weights a TopK with this config emits already carry
+    routed_scaling_factor.
+
+    When true, no step after top-k may apply the factor again, and a fused
+    shared expert's weight must not compensate for a multiply that never
+    happens.
+    """
+    if topk_config.apply_routed_scaling_factor_on_output:
+        return True
+    if not _use_aiter:
+        return False
+    # Two aiter routes fold the factor whatever the flag says: grouped routing
+    # with a correction bias (aiter_biased_grouped_topk / the unified Triton
+    # router) and ungrouped sqrtsoftplus routing (aiter topk_gating /
+    # rocm_router_gate). Grouped routing without a bias and the other
+    # ungrouped routes do not.
+    if topk_config.use_grouped_topk:
+        return topk_config.correction_bias is not None
+    return (
+        topk_config.scoring_func == "sqrtsoftplus"
+        and topk_config.custom_routing_function is None
+    )
+
+
+def fused_shared_expert_weight(
+    *, routed_scaling_factor: Optional[float], fused_in_topk: bool
+) -> float:
+    """Top-k weight that makes a fused shared expert's output count exactly
+    once. `fused_in_topk` is is_routed_scaling_factor_fused_in_topk's answer.
+
+    * factor folded into the routed weights (or no factor): nothing scales the
+      MoE output afterwards, so the shared slot must carry 1.0;
+    * factor applied after the experts (DeepseekV2MoE.forward_deepep's
+      epilogue): the shared column is scaled too, so it must carry 1/rsf.
+    """
+    if fused_in_topk or not routed_scaling_factor:
+        return 1.0
+    return 1.0 / routed_scaling_factor
+
+
 def remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
