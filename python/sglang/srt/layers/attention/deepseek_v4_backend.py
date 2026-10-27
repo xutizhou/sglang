@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import enum
+import os
+import json
 import functools
 import logging
 from dataclasses import dataclass, field
@@ -92,6 +94,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_DSV4_KV_DUMP = os.environ.get("SGLANG_DSV4_KV_DUMP", "0") == "1"
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -1378,8 +1381,51 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
+        # Layer-split KV pool (prefill CP): tell the pool which pages this step
+        # touches before any layer reads/writes, so non-owned layers can be
+        # materialised from their owner. Must run before the model forward and
+        # identically on every CP rank (the batch is unsharded under CP-v1).
+        if _DSV4_KV_DUMP:
+            self._dsv4_debug_dump_prev_step(forward_batch)
+        begin_step = getattr(self.token_to_kv_pool, "begin_step", None)
+        if begin_step is not None:
+            begin_step(forward_batch, req_to_token=self.req_to_token)
+
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    def _dsv4_debug_dump_prev_step(self, forward_batch: ForwardBatch) -> None:
+        """Debug (SGLANG_DSV4_KV_DUMP=1): log per-layer KV checksums over the pages of
+        the previous forward step, then remember this step's pages."""
+        prev = getattr(self, "_dsv4_debug_prev_pages", None)
+        if prev is not None:
+            kv_pages, swa_pages, n_tok = prev
+            sums = self.token_to_kv_pool.debug_layer_checksums(kv_pages, swa_pages)
+            logger.info(
+                "DSV4 KV DUMP tokens=%d kv_pages=%d swa_pages=%d %s",
+                n_tok,
+                kv_pages.numel(),
+                0 if swa_pages is None else swa_pages.numel(),
+                json.dumps(sums, sort_keys=True),
+            )
+        self._dsv4_debug_prev_pages = None
+        if forward_batch.req_pool_indices is None or forward_batch.req_pool_indices.numel() == 0:
+            return
+        rows = self.req_to_token[forward_batch.req_pool_indices.long()]
+        seq_lens = forward_batch.seq_lens
+        max_len = int(seq_lens.max().item())
+        rows = rows[:, :max_len]
+        mask = torch.arange(max_len, device=rows.device)[None, :] < seq_lens[:, None]
+        tokens = rows[mask].long()
+        kv_pages = torch.unique(tokens // self.page_size)
+        mapping = getattr(self.token_to_kv_pool, "full_to_swa_index_mapping", None)
+        swa_pages = None
+        if mapping is not None:
+            loc = mapping[tokens]
+            loc = loc[loc >= 0].long()
+            if loc.numel() > 0:
+                swa_pages = torch.unique(loc // self.token_to_kv_pool.swa_page_size)
+        self._dsv4_debug_prev_pages = (kv_pages, swa_pages, int(tokens.numel()))
 
     def _build_forward_metadata(
         self,

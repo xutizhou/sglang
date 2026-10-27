@@ -160,7 +160,29 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     if not server_args.enable_prefill_cp:
+        if server_args.enable_dsa_cache_layer_split:
+            raise ValueError(
+                "--enable-dsa-cache-layer-split for DeepSeekV4 requires "
+                "--enable-prefill-cp --cp-strategy interleave."
+            )
         return
+    if server_args.enable_dsa_cache_layer_split:
+        if server_args.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is only supported on PD prefill "
+                "workers for DeepSeekV4."
+            )
+        if server_args.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+            raise ValueError(
+                "DeepSeekV4 cache layer split supports the nixl and mooncake "
+                "transfer backends, got "
+                f"{server_args.disaggregation_transfer_backend!r}."
+            )
+        logger.warning(
+            "DeepSeekV4 prefill CP: KV pools (SWA/c4/c128/indexer) are sharded by "
+            "layer across CP ranks (--enable-dsa-cache-layer-split); every CP rank "
+            "transfers its own layer slice to the decode workers."
+        )
 
     if server_args.cp_strategy != "interleave":
         raise ValueError(

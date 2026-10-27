@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
+    synthesize_compressed_mla_layer_ids,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
 )
@@ -1040,9 +1041,42 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
+            src_layer_ids = self.kv_args.kv_layer_ids
+            dst_layer_ids = peer_info.dst_kv_layer_ids
+            mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+            if (
+                mla_ratios
+                and n_src < n_dst
+                and not src_layer_ids
+                and not dst_layer_ids
+                and self.kv_args.prefill_end_layer is not None
+            ):
+                # Compressed-MLA layer slice (PP stage or prefill-CP layer split)
+                # peered with a full-model decode: derive ids from the bucket
+                # layout so the pairing matches _mla_slice_ptrs_for_pp instead of
+                # a positional (wrong) or rejected pairing.
+                synthesized = synthesize_compressed_mla_layer_ids(
+                    list(mla_ratios),
+                    int(self.kv_args.prefill_start_layer),
+                    int(self.kv_args.prefill_end_layer),
+                    n_src,
+                    n_dst,
+                )
+                if synthesized is not None:
+                    src_layer_ids, dst_layer_ids = synthesized
+                    logger.info(
+                        "compressed-MLA layer slice pairing: layers "
+                        f"[{self.kv_args.prefill_start_layer},{self.kv_args.prefill_end_layer}) "
+                        f"src={n_src} dst={n_dst} peer={peer_info.agent_name}"
+                    )
+                else:
+                    logger.warning(
+                        "compressed-MLA layer slice does not match the decode "
+                        f"layout (src={n_src}, dst={n_dst}); leaving pairing untouched"
+                    )
             pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
+                src_layer_ids,
+                dst_layer_ids,
                 n_src,
                 n_dst,
                 allow_positional_fallback=self.pp_size == 1,

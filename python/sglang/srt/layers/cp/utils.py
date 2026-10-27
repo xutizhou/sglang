@@ -69,6 +69,36 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     )
 
 
+def is_dsv4_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
+    """Whether the DeepSeek V4 paged KV pools are sharded by layer across CP ranks.
+
+    DeepSeek V4 counterpart of ``is_glm_dsa_cache_layer_split_enabled``: a
+    prefill-CP-only optimisation on PD prefill workers (see
+    ``mem_cache/deepseek_v4_layer_split.py``). Draft workers keep the full pool.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    return (
+        not model_runner.is_draft_worker
+        and model_runner.server_args.enable_dsa_cache_layer_split
+        and is_deepseek_v4(model_runner.model_config.hf_config)
+        and get_parallel().attn_cp_size > 1
+    )
+
+
+def get_dsv4_cp_layer_shard_info(
+    model_runner: "ModelRunner",
+) -> Tuple[Optional[int], int]:
+    """``(layer_shard_rank, layer_shard_size)`` for the DeepSeek V4 KV pool;
+    ``(None, 1)`` disables sharding."""
+    if not is_dsv4_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_parallel().attn_cp_size
+    if shard_size <= 1:
+        return None, 1
+    return get_parallel().attn_cp_rank, shard_size
+
+
 def get_glm_dsa_cp_layer_shard_info(
     model_runner: "ModelRunner",
 ) -> Tuple[Optional[int], int]:

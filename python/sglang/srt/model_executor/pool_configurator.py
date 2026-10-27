@@ -811,6 +811,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        # Paged KV layers this rank materialises (owned + one scratch layer per
+        # pool type under DSV4 prefill-CP layer split); the replicated compress
+        # states still count every layer. Equal to the totals without layer split.
+        (
+            self.kv_layers_total,
+            self.kv_layers_ca4,
+            self.kv_layers_ca128,
+        ) = self._dsv4_layer_split_kv_layer_counts(kvc)
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -878,6 +886,34 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
+    def _dsv4_layer_split_kv_layer_counts(self, kvc) -> tuple[int, int, int]:
+        from sglang.srt.layers.cp.utils import (
+            get_dsv4_cp_layer_shard_info,
+            get_layer_shard_range,
+        )
+
+        shard_rank, shard_size = get_dsv4_cp_layer_shard_info(kvc)
+        if shard_rank is None:
+            return self.num_layers_total, self.num_layers_ca4, self.num_layers_ca128
+        # Size for the largest shard so every CP rank fits the same token budget
+        # (the schedulers must agree on max_total_num_tokens).
+        worst = (0, 0, 0)
+        for rank in range(shard_size):
+            s, e = get_layer_shard_range(rank, shard_size, self.num_layers_total)
+            owned = self.compression_ratios[s:e]
+            cand = (
+                len(owned) + 1,
+                sum(1 for r in owned if r == 4) + 1,
+                sum(1 for r in owned if r == 128) + 1,
+            )
+            worst = tuple(max(a, b) for a, b in zip(worst, cand))
+        logger.info(
+            "DSV4 layer split sizing: kv layers per rank (incl. scratch) "
+            f"total={worst[0]}/{self.num_layers_total} c4={worst[1]}/{self.num_layers_ca4} "
+            f"c128={worst[2]}/{self.num_layers_ca128}"
+        )
+        return worst
+
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
@@ -908,10 +944,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
+            self.swa_ratio * kv_bytes * self.kv_layers_total
+            + c4_frac * kv_bytes * self.kv_layers_ca4
+            + 1 / 128 * kv_bytes * self.kv_layers_ca128
+            + 1 / 4 * indexer_bytes * self.kv_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + self.swa_ratio
