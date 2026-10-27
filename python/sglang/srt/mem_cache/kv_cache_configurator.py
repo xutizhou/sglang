@@ -1110,7 +1110,24 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        pool_kwargs = {}
+        from sglang.srt.layers.cp.utils import get_dsv4_cp_layer_shard_info
+
+        dsv4_shard_rank, dsv4_shard_size = get_dsv4_cp_layer_shard_info(self)
+        if dsv4_shard_rank is not None:
+            assert pool_cls is DeepSeekV4TokenToKVPool, (
+                "DSV4 cache layer split is only supported with the CUDA DSV4 pool"
+            )
+            from sglang.srt.mem_cache.deepseek_v4_layer_split import (
+                LayerSplitDeepSeekV4TokenToKVPool,
+            )
+
+            pool_cls = LayerSplitDeepSeekV4TokenToKVPool
+            pool_kwargs["layer_shard_rank"] = dsv4_shard_rank
+            pool_kwargs["layer_shard_size"] = dsv4_shard_size
+
         token_to_kv_pool = pool_cls(
+            **pool_kwargs,
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.

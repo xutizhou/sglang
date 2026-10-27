@@ -219,11 +219,19 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-        kv_args.prefill_end_layer = (
-            kv_args.prefill_start_layer + len(kv_data_ptrs)
-            if layer_shard_enabled
-            else getattr(self.token_to_kv_pool, "end_layer", None)
-        )
+        if layer_shard_enabled:
+            # Pools laid out by compression bucket (DeepSeek V4) report one entry
+            # per (layer, bucket), so derive the owned range from the pool when
+            # it exposes it instead of counting entries.
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool,
+                "layer_shard_end",
+                kv_args.prefill_start_layer + len(kv_data_ptrs),
+            )
+        else:
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool, "end_layer", None
+            )
 
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are

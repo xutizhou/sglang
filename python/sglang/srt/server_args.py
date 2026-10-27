@@ -5615,6 +5615,7 @@ class ServerArgs:
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
+            is_deepseek_v4,
         )
 
         if self.enable_deterministic_inference:
@@ -5647,10 +5648,12 @@ class ServerArgs:
                     "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
                 )
 
-        if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
+        if self.enable_dsa_cache_layer_split and not (
+            is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+        ):
             raise ValueError(
                 "--enable-dsa-cache-layer-split is only supported for DSA "
-                "(DeepSeek Sparse Attention) models."
+                "(DeepSeek Sparse Attention) models and DeepSeek V4."
             )
 
         if self.enable_cp_decode_attn_tp:

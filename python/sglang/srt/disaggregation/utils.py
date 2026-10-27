@@ -868,6 +868,34 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def synthesize_compressed_mla_layer_ids(
+    compression_ratios: List[int],
+    start_layer: int,
+    end_layer: int,
+    n_src: int,
+    n_dst: int,
+) -> Optional[Tuple[List[int], List[int]]]:
+    """Layer ids for a compressed-MLA (DeepSeek V4) ``kv_data`` list.
+
+    The V4 pool lays its transfer entries out by compression bucket rather than
+    by layer -- ``[c4 kv][c4 indexer][c128 kv]`` -- and does not report layer
+    ids. When the prefill side only holds a layer slice (pipeline stage or
+    prefill-CP layer split) and the decode side the whole model, pairing the
+    entries needs ids on both sides. Returns ``(src_ids, dst_ids)`` matching
+    that layout, or ``None`` when the lengths do not fit the layout (caller
+    falls back to the existing behaviour).
+    """
+    c4 = [l for l, r in enumerate(compression_ratios) if r == 4]
+    c128 = [l for l, r in enumerate(compression_ratios) if r == 128]
+    dst_ids = c4 + c4 + c128
+    c4_local = [l for l in c4 if start_layer <= l < end_layer]
+    c128_local = [l for l in c128 if start_layer <= l < end_layer]
+    src_ids = c4_local + c4_local + c128_local
+    if len(src_ids) != n_src or len(dst_ids) != n_dst:
+        return None
+    return src_ids, dst_ids
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],

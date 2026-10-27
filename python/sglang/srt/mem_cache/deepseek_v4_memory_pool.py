@@ -655,6 +655,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_paged_compress_states(enable_memory_saver)
 
+    def debug_layer_checksums(self, kv_pages: torch.Tensor, swa_pages) -> dict:
+        """Debug: per-layer byte sums over the given pages (skips empty layers)."""
+        out = {}
+        for l in range(self._stage_start, self._stage_end):
+            item = self.layer_mapping[l]
+            if item is None:
+                continue
+            swa_buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(l)]
+            if swa_pages is not None and swa_buf.shape[0] > 0:
+                out[f"swa{l}"] = int(swa_buf.index_select(0, swa_pages).long().sum().item())
+            if item.compress_ratio in (4, 128) and kv_pages is not None:
+                buf = item.compress_kv_pool.kv_buffer[item.compress_layer_id]
+                if buf.shape[0] > 0:
+                    out[f"c{item.compress_ratio}_{l}"] = int(
+                        buf.index_select(0, kv_pages).long().sum().item()
+                    )
+            if item.compress_ratio == 4 and kv_pages is not None:
+                ib = self.c4_indexer_kv_pool.index_k_with_scale_buffer[item.compress_layer_id]
+                if ib.shape[0] > 0:
+                    out[f"idx{l}"] = int(ib.index_select(0, kv_pages).long().sum().item())
+        return out
+
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
         # layer's transfer before attention reads it. No-op when HiCache is off.
