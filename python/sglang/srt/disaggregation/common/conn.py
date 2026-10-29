@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1213,14 +1214,29 @@ class CommonKVSender(BaseKVSender):
             "bootstrap_room": self.bootstrap_room,
             "dp_rank": self.kv_mgr.attn_dp_rank,
         }
-        try:
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code != 200:
-                logger.error(
-                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to register prefill dp_rank: {e}")
+        from sglang.srt.managers.maas_ipc_delivery import trace
+
+        failure = ""
+        for attempt in range(3):
+            try:
+                response = requests.post(url, json=payload, timeout=2)
+                if response.status_code == 200:
+                    trace(
+                        "bootstrap_registered",
+                        None,
+                        self.bootstrap_room,
+                        dp=self.kv_mgr.attn_dp_rank,
+                    )
+                    return
+                failure = f"HTTP {response.status_code}: {response.text[:256]}"
+            except requests.RequestException as exc:
+                failure = str(exc)
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+        message = f"Prefill rank registration failed for room={self.bootstrap_room}: {failure}"
+        logger.error(message)
+        self.kv_mgr.record_failure(self.bootstrap_room, message)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
@@ -1356,6 +1372,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
+        self.bootstrap_started_at = time.monotonic()
         self.abort_notified: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
@@ -1572,6 +1589,23 @@ class CommonKVReceiver(BaseKVReceiver):
         decode_prefix_len: Optional[int] = None,
     ):
         raise NotImplementedError
+
+    def _check_rank_discovery_timeout(self) -> Optional[KVPoll]:
+        # Receiver.init() cannot run until the prefill rank is discovered.
+        # Cover that interval separately from the existing KV transfer timer.
+        elapsed = time.monotonic() - self.bootstrap_started_at
+        if elapsed < float(
+            os.environ.get("MAAS_RANK_DISCOVERY_TIMEOUT", self.kv_mgr.waiting_timeout)
+        ):
+            return None
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Prefill DP rank discovery timed out after {elapsed:.1f}s "
+            f"for {self.bootstrap_addr}, room={self.bootstrap_room}",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.conclude_state = KVPoll.Failed
+        return self.conclude_state
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
