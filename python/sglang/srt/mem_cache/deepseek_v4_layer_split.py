@@ -212,10 +212,25 @@ class LayerSplitDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         self._step_swa_pages: Optional[torch.Tensor] = None
         self._step_active = False
         self._step_id = 0
-        self._stats = {"bcast_bytes": 0, "bcast_calls": 0}
+        self._stats = {"bcast_bytes": 0, "bcast_calls": 0, "prefetch_hits": 0}
         import os
 
         self._debug = os.environ.get("SGLANG_DSV4_LAYER_SPLIT_DEBUG", "0") == "1"
+        # Owner-broadcast prefetch of the next layer of each kind on a side stream
+        # (SGLANG_DSV4_LAYER_SPLIT_PREFETCH=0 disables it).
+        self._prefetch_enabled = (
+            os.environ.get("SGLANG_DSV4_LAYER_SPLIT_PREFETCH", "1") == "1"
+        )
+        self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        # kind -> (layer_id, payload, event) for an in-flight prefetch.
+        self._prefetched: Dict[str, Tuple[int, Optional[torch.Tensor], torch.cuda.Event]] = {}
+        stage_ids = self._stage_layer_ids()
+        self._layers_of_kind: Dict[str, List[int]] = {
+            _KIND_SWA: list(stage_ids),
+            _KIND_C4: [l for l in stage_ids if self.compression_ratios[l] == 4],
+            _KIND_IDX: [l for l in stage_ids if self.compression_ratios[l] == 4],
+            _KIND_C128: [l for l in stage_ids if self.compression_ratios[l] == 128],
+        }
         self._log_plan()
 
     # ------------------------------------------------------------------ setup
@@ -360,21 +375,24 @@ class LayerSplitDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         if self._debug and (self._step_id < 5 or self._step_id % 200 == 0):
             logger.info(
                 "DSV4 layer split step %d done: kv_pages=%s swa_pages=%s "
-                "bcast_calls=%d bcast_MiB=%.1f",
+                "bcast_calls=%d bcast_MiB=%.1f prefetch_hits=%d",
                 self._step_id,
                 None if self._step_kv_pages is None else int(self._step_kv_pages.numel()),
                 None if self._step_swa_pages is None else int(self._step_swa_pages.numel()),
                 self._stats["bcast_calls"],
                 self._stats["bcast_bytes"] / 2**20,
+                self._stats["prefetch_hits"],
             )
         self._step_id += 1
         for kind in self._scratch_layer:
             self._scratch_layer[kind] = None
+        self._prefetched.clear()
         self._step_kv_pages = None
         self._step_swa_pages = None
         self._step_active = True
         self._stats["bcast_calls"] = 0
         self._stats["bcast_bytes"] = 0
+        self._stats["prefetch_hits"] = 0
 
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
         seq_lens = getattr(forward_batch, "seq_lens", None)
@@ -429,6 +447,53 @@ class LayerSplitDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         return compress_kv_pool.kv_buffer[compress_layer_id]
 
+    def _next_layer_of_kind(self, kind: str, layer_id: int) -> Optional[int]:
+        layers = self._layers_of_kind[kind]
+        try:
+            i = layers.index(layer_id)
+        except ValueError:
+            return None
+        return layers[i + 1] if i + 1 < len(layers) else None
+
+    def _gather_and_broadcast(
+        self, kind: str, layer_id: int, pages: torch.Tensor
+    ) -> torch.Tensor:
+        """Owner gathers ``pages`` of ``layer_id`` and broadcasts them; returns the
+        payload (on every rank). Runs on the current stream."""
+        owned = self._is_owned_global(layer_id)
+        scratch = self._scratch[kind]
+        if owned:
+            payload = self._owned_buffer(kind, layer_id).index_select(0, pages)
+        else:
+            payload = torch.empty(
+                (pages.numel(), scratch.shape[1]),
+                dtype=scratch.dtype,
+                device=scratch.device,
+            )
+        get_parallel().attn_cp_group.broadcast(
+            payload, src=self._owner_rank_global(layer_id)
+        )
+        self._stats["bcast_bytes"] += payload.nbytes
+        self._stats["bcast_calls"] += 1
+        return payload
+
+    def _prefetch(self, kind: str, layer_id: int) -> None:
+        """Issue the owner broadcast for ``layer_id`` on the side stream so it
+        overlaps the current layer's compute. Every CP rank issues the same
+        sequence of prefetches, so the collectives stay matched."""
+        pages = self._pages_for(kind)
+        if pages is None or pages.numel() == 0 or kind in self._prefetched:
+            return
+        if self._scratch_layer.get(kind) == layer_id:
+            return
+        cur = torch.cuda.current_stream()
+        self._prefetch_stream.wait_stream(cur)
+        with torch.cuda.stream(self._prefetch_stream):
+            payload = self._gather_and_broadcast(kind, layer_id, pages)
+            event = torch.cuda.Event()
+            event.record(self._prefetch_stream)
+        self._prefetched[kind] = (layer_id, payload, event)
+
     def _materialize(self, kind: str, layer_id: int) -> torch.Tensor:
         """Return the buffer to use for ``layer_id``: the owned pool buffer on the
         owner, otherwise the scratch buffer filled from the owner's pages."""
@@ -437,23 +502,24 @@ class LayerSplitDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
             return self._owned_buffer(kind, layer_id) if owned else self._scratch[kind]
         scratch = self._scratch[kind]
         pages = self._pages_for(kind)
-        owner = self._owner_rank_global(layer_id)
-        cp_group = get_parallel().attn_cp_group
         if pages is not None and pages.numel() > 0:
-            if owned:
-                payload = self._owned_buffer(kind, layer_id).index_select(0, pages)
+            pf = self._prefetched.pop(kind, None)
+            if pf is not None and pf[0] == layer_id:
+                _, payload, event = pf
+                torch.cuda.current_stream().wait_event(event)
+                self._stats["prefetch_hits"] += 1
             else:
-                payload = torch.empty(
-                    (pages.numel(), scratch.shape[1]),
-                    dtype=scratch.dtype,
-                    device=scratch.device,
-                )
-            cp_group.broadcast(payload, src=owner)
+                # Prefetch for a different layer (should not happen: the touch
+                # order is deterministic) -- fall back to a synchronous broadcast.
+                payload = self._gather_and_broadcast(kind, layer_id, pages)
             if not owned:
                 scratch.index_copy_(0, pages, payload)
-            self._stats["bcast_bytes"] += payload.nbytes
-            self._stats["bcast_calls"] += 1
+            payload.record_stream(torch.cuda.current_stream())
         self._scratch_layer[kind] = layer_id
+        if self._prefetch_enabled:
+            nxt = self._next_layer_of_kind(kind, layer_id)
+            if nxt is not None:
+                self._prefetch(kind, nxt)
         return self._owned_buffer(kind, layer_id) if owned else scratch
 
     def _buffer_for(self, kind: str, layer_id: int) -> torch.Tensor:
