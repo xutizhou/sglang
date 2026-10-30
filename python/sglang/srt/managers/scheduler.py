@@ -456,6 +456,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_flexkv = bool(
+            get_memory().enable_flexkv or get_memory().radix_cache_backend == "flexkv"
+        )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -2824,6 +2827,10 @@ class Scheduler(
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                 )
+        elif self.enable_flexkv:
+            logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
+            # The adapter starts either legacy or chunked prefetch from its config.
+            self.tree_cache.prefetch_request(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2900,7 +2907,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
+                if self.enable_hicache_storage or self.enable_flexkv:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
@@ -2930,7 +2937,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
+                if self.enable_hicache_storage or self.enable_flexkv:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -3067,7 +3074,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_flexkv:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -3303,7 +3310,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if self.enable_hierarchical_cache or self.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3384,7 +3391,9 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and not self.tree_cache.has_uncommitted_restore(
+            self.chunked_req
+        ):
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -3406,6 +3415,13 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A FlexKV restore owns request-local GPU slots until the previous
+            # batch commits them to the radix cache. Do not rematch the request
+            # in that window: match_prefix would otherwise replace the only
+            # request-side reference before cache completion.
+            if self.tree_cache.has_uncommitted_restore(req):
+                continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3425,7 +3441,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_flexkv:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3436,6 +3452,11 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"
@@ -3464,8 +3485,9 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
+                    if self.enable_hierarchical_cache or self.enable_flexkv:
+                        # An idle FlexKV batch must retry when host-cache pressure
+                        # clears; no running decode can reset batch_is_full for it.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
@@ -3477,6 +3499,15 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    # A successful storage restore must be followed by batch
+                    # admission in this same pass. Freeing a layerwise restore
+                    # here would race its asynchronous H2D writer, so fail loud
+                    # if a future admission check violates that ordering.
+                    if self.tree_cache.has_uncommitted_restore(req):
+                        raise RuntimeError(
+                            "Request was rejected after storage load-back: "
+                            f"rid={req.rid}"
+                        )
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
@@ -4669,7 +4700,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_flexkv:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
@@ -4702,7 +4733,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                if self.enable_hicache_storage:
+                if self.enable_hicache_storage or self.enable_flexkv:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
@@ -4726,7 +4757,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
+                    if self.enable_hicache_storage or self.enable_flexkv:
                         self.tree_cache.release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):

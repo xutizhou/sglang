@@ -99,6 +99,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -869,6 +870,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1007,6 +1009,12 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # A storage load-back remains request-owned until cache_finished_req or
+        # cache_unfinished_req transfers those slots into the prefix cache.
+        # Keep that ownership separate from prefix_indices: the latter is
+        # rebuilt on every prefix match and cannot identify an in-flight restore.
+        self.pending_restore_generation: Optional[int] = None
+        self.pending_restore_slots: Optional[torch.Tensor] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
