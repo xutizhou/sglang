@@ -168,11 +168,30 @@ class PatchedSourceTest(unittest.IsolatedAsyncioTestCase):
         self.prefix = "python/sglang/srt/"
 
     def test_tokenizer_startup_without_distributed_process_group(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self._check_tokenizer_startup(mode)
         fn = method(
             self.root / (self.prefix + "managers/tokenizer_manager.py"),
             "TokenizerManager",
             "init_running_status",
-            get_disagg=lambda: NS(disaggregation_mode="prefill"),
+            get_disagg=lambda: NS(disaggregation_mode="null"),
+            get_parallel=lambda: NS(enable_dp_attention=True),
+            get_serving=lambda: NS(tokenizer_worker_num=1),
+            AcknowledgedDispatch=AcknowledgedDispatch,
+            ServerStatus=NS(Starting="starting"),
+            real_time=time.time,
+        )
+        with patch.dict(os.environ, MAAS_PREFILL_IPC_ACK="1"):
+            with self.assertRaises(AssertionError):
+                fn(NS(server_args=NS(tp_size=4, dp_size=4, attn_cp_size=1)))
+
+    def _check_tokenizer_startup(self, mode):
+        fn = method(
+            self.root / (self.prefix + "managers/tokenizer_manager.py"),
+            "TokenizerManager",
+            "init_running_status",
+            get_disagg=lambda: NS(disaggregation_mode=mode),
             # Only config-backed properties exist in the tokenizer process.
             get_parallel=lambda: NS(enable_dp_attention=True),
             get_serving=lambda: NS(tokenizer_worker_num=1),
