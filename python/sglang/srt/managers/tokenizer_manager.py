@@ -592,9 +592,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await async_sock_send(self.send_to_scheduler, obj)
 
     def init_running_status(self):
+        # Acknowledged, retried dispatch to the externally selected DP rank.
+        # Prefill (2026-10-29) and, since 2026-10-31, the DP-attention Decode:
+        # with DP4 attention the Decode lost ~0.1% of requests between this
+        # tokenizer and the DP schedulers (no admission, KVPoll timeout on the
+        # Prefill after 1800 s, request never completes). The env name is kept
+        # for compatibility with the Prefill deployments.
         self._ipc_ack_enabled = os.environ.get("MAAS_PREFILL_IPC_ACK") == "1"
         if self._ipc_ack_enabled:
-            assert get_disagg().disaggregation_mode == "prefill"
+            assert get_disagg().disaggregation_mode in ("prefill", "decode")
             assert get_parallel().enable_dp_attention
             assert get_serving().tokenizer_worker_num == 1
             # Tokenizer has no distributed process group; validate launch config.

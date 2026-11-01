@@ -14,6 +14,34 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
+def prewarm_target_hidden_projection(
+    draft_model, *, device: torch.device, dtype: torch.dtype
+) -> bool:
+    """Run the draft's target-hidden projection once so its GEMM is compiled
+    before the worker serves.
+
+    The projection (DeepSeek-V4 DSpark ``main_proj``: hidden * num_target_layers
+    -> hidden, N=4096 K=12288 for V4-Flash) runs on the eager target-hidden
+    inject paths, which neither startup warm-up nor CUDA graph capture exercises
+    on the Decode, so nothing compiles it before serving. With
+    the FP8 DeepGEMM backend its first call opens the "all Ms" JIT pre-compile
+    session while serving, and in the DP-attention Decode every scheduler then
+    waits for it: 46-80 s on H20 (2026-10-30/31), long enough to time out the
+    acknowledged dispatch. One row is enough to trigger the same pre-compile
+    here. Returns whether a projection ran.
+    """
+    stages = getattr(draft_model, "stages", None)
+    if not stages or not hasattr(draft_model, "project_target_hidden"):
+        return False
+    input_size = getattr(getattr(stages[0], "main_proj", None), "input_size", None)
+    if not input_size:
+        return False
+    hidden = torch.zeros((1, input_size), dtype=dtype, device=device)
+    with torch.inference_mode():
+        draft_model.project_target_hidden(hidden)
+    return True
+
+
 class TargetHiddenKvInjector:
     def __init__(
         self,

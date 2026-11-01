@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
+    prewarm_target_hidden_projection,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
@@ -390,6 +391,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        # Compile the eager-only target-hidden projection now, not on the first
+        # unfolded verify commit while serving (see the helper's docstring).
+        if prewarm_target_hidden_projection(
+            self.draft_model, device=self.device, dtype=self.model_runner.dtype
+        ):
+            logger.info("DSpark target-hidden projection pre-warmed")
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
