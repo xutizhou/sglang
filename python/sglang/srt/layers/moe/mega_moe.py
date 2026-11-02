@@ -296,6 +296,16 @@ def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> in
     if not config.use_dp_max_tokens:
         return num_tokens
     global_num_tokens = _get_dp_global_num_tokens_or_none()
+    if (
+        config.uses_sm120_routed_api
+        and os.environ.get("SGLANG_SM120_MEGAMOE_FLASHINFER") == "1"
+    ):
+        if not global_num_tokens:
+            raise RuntimeError("FlashInfer SM120 MegaMoE requires DP token counts")
+        bucket = max(global_num_tokens)
+        if num_tokens > bucket:
+            raise ValueError("DP token bucket is smaller than local hidden states")
+        return bucket
     if not global_num_tokens:
         effective_num_tokens = num_tokens
     else:
@@ -603,7 +613,16 @@ def _run_sm120_routed(
             f"[{num_tokens}, 8192], got {effective_num_tokens}"
         )
 
-    if effective_num_tokens == num_tokens:
+    use_flashinfer = os.environ.get("SGLANG_SM120_MEGAMOE_FLASHINFER") == "1"
+    if use_flashinfer and num_tokens == 0:
+        launch_hidden_states = hidden_states
+        launch_topk_ids = torch.empty(
+            (0, top_k), dtype=torch.int64, device=hidden_states.device
+        )
+        launch_topk_weights = torch.empty(
+            (0, top_k), dtype=torch.float32, device=hidden_states.device
+        )
+    elif use_flashinfer or effective_num_tokens == num_tokens:
         assert topk_ids is not None and topk_weights is not None
         launch_hidden_states = hidden_states
         launch_topk_ids = topk_ids.to(dtype=torch.int64).contiguous()
@@ -636,6 +655,21 @@ def _run_sm120_routed(
         group_size=32,
     )
     ep_group = get_moe_ep_group().device_group
+    if use_flashinfer:
+        from sglang.srt.layers.moe.sm120_flashinfer_moe import run
+
+        y = run(
+            moe,
+            ep_group,
+            x,
+            x_scales,
+            launch_topk_ids,
+            launch_topk_weights,
+            effective_num_tokens,
+        )[:num_tokens]
+        if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+            y.mul_(moe.routed_scaling_factor)
+        return y
     session, workspace = _get_sm120_routed_moe_state(ep_group)
     # Align DP ranks before the collective GIN launch.
     torch.distributed.barrier(
