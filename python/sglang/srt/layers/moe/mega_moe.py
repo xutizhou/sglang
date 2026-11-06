@@ -45,6 +45,35 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _SM120_ROUTED_MOE_STATE: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_SM120_FLASHINFER_ENABLED: Optional[bool] = None
+
+
+def _sm120_flashinfer_enabled() -> bool:
+    """FlashInfer SM120 Cake MegaMoE dispatch: on by default when available.
+
+    SGLANG_SM120_MEGAMOE_FLASHINFER=1/0 forces the choice. When unset, the
+    FlashInfer path is used if flashinfer.moe_ep imports (>=0.7.2); otherwise
+    fall back to the DeepGEMM kernel so older FlashInfer installs keep working.
+    """
+    global _SM120_FLASHINFER_ENABLED
+    if _SM120_FLASHINFER_ENABLED is None:
+        value = os.environ.get("SGLANG_SM120_MEGAMOE_FLASHINFER")
+        if value is not None:
+            _SM120_FLASHINFER_ENABLED = value == "1"
+        else:
+            try:
+                from flashinfer.moe_ep import MegaConfig  # noqa: F401
+
+                _SM120_FLASHINFER_ENABLED = True
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "SM120 MegaMoE: flashinfer.moe_ep unavailable; "
+                    "falling back to the DeepGEMM kernel"
+                )
+                _SM120_FLASHINFER_ENABLED = False
+    return _SM120_FLASHINFER_ENABLED
 
 
 @dataclass(frozen=True)
@@ -298,7 +327,7 @@ def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> in
     global_num_tokens = _get_dp_global_num_tokens_or_none()
     if (
         config.uses_sm120_routed_api
-        and os.environ.get("SGLANG_SM120_MEGAMOE_FLASHINFER") == "1"
+        and _sm120_flashinfer_enabled()
     ):
         if not global_num_tokens:
             raise RuntimeError("FlashInfer SM120 MegaMoE requires DP token counts")
@@ -613,7 +642,7 @@ def _run_sm120_routed(
             f"[{num_tokens}, 8192], got {effective_num_tokens}"
         )
 
-    use_flashinfer = os.environ.get("SGLANG_SM120_MEGAMOE_FLASHINFER") == "1"
+    use_flashinfer = _sm120_flashinfer_enabled()
     if use_flashinfer and num_tokens == 0:
         launch_hidden_states = hidden_states
         launch_topk_ids = torch.empty(
