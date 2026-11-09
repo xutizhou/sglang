@@ -4,6 +4,7 @@ import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
+import os
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
@@ -654,6 +655,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        if os.environ.get("SGLANG_DSV4_KV_DUMP_ZERO_STATES", "0") == "1":
+            # Debug only: zero the compress-state rings so rows a request never writes
+            # read as 0 in SGLANG_DSV4_KV_DUMP checksums (no stale startup memory).
+            for _pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+                for _pool in _pools:
+                    if _pool is not None:
+                        _pool.kv_score_buffer.kv_score.zero_()
 
     def debug_layer_checksums(self, kv_pages: torch.Tensor, swa_pages, state_reqs=None) -> dict:
         """Debug: per-layer byte sums over the given pages (skips empty layers).
