@@ -655,9 +655,41 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_paged_compress_states(enable_memory_saver)
 
-    def debug_layer_checksums(self, kv_pages: torch.Tensor, swa_pages) -> dict:
-        """Debug: per-layer byte sums over the given pages (skips empty layers)."""
+    def debug_layer_checksums(self, kv_pages: torch.Tensor, swa_pages, state_reqs=None) -> dict:
+        """Debug: per-layer byte sums over the given pages (skips empty layers).
+
+        With ``state_reqs`` [(req_pool_idx, seq_len)], also sums the compress-state rows the PD
+        transfer sends: c4 attention/indexer state items of ``swa_pages`` (ring_size rows each,
+        as in get_state_buf_infos) and the C128 state item(s) of each request
+        (get_dsv4_c128_state_indices)."""
         out = {}
+        if state_reqs is not None:
+            from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
+
+            def _rows(buf, items, rows_per_item):
+                if items is None or len(items) == 0:
+                    return None
+                idx = torch.as_tensor(items, device=buf.device, dtype=torch.long)
+                rows = (idx[:, None] * rows_per_item + torch.arange(rows_per_item, device=buf.device)[None, :]).reshape(-1)
+                rows = rows[rows < buf.shape[0]]
+                return int(buf.index_select(0, rows).view(torch.uint8).long().sum().item())
+
+            for name, pools in (("st", self.compress_state_pools), ("ist", self.indexer_compress_state_pools)):
+                for l, pool in enumerate(pools):
+                    if pool is None:
+                        continue
+                    buf = pool.kv_score_buffer.kv_score
+                    if pool.ratio == 128:
+                        items, per = [], (1 if ONLINE_C128 else 128)
+                        for rp, sl in state_reqs:
+                            items += get_dsv4_c128_state_indices(
+                                int(rp), int(sl), online=ONLINE_C128, ring_size=self.get_ring_size(128)
+                            ).tolist()
+                        v = _rows(buf, items, per)
+                    else:
+                        v = _rows(buf, None if swa_pages is None else swa_pages.tolist(), pool.ring_size)
+                    if v is not None:
+                        out[f"{name}{pool.ratio}_{l}"] = v
         for l in range(self._stage_start, self._stage_end):
             item = self.layer_mapping[l]
             if item is None:

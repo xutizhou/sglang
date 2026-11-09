@@ -1399,8 +1399,8 @@ class DeepseekV4AttnBackend(
         the previous forward step, then remember this step's pages."""
         prev = getattr(self, "_dsv4_debug_prev_pages", None)
         if prev is not None:
-            kv_pages, swa_pages, n_tok = prev
-            sums = self.token_to_kv_pool.debug_layer_checksums(kv_pages, swa_pages)
+            kv_pages, swa_pages, n_tok, state_reqs = prev
+            sums = self.token_to_kv_pool.debug_layer_checksums(kv_pages, swa_pages, state_reqs)
             logger.info(
                 "DSV4 KV DUMP tokens=%d kv_pages=%d swa_pages=%d %s",
                 n_tok,
@@ -1425,7 +1425,8 @@ class DeepseekV4AttnBackend(
             loc = loc[loc >= 0].long()
             if loc.numel() > 0:
                 swa_pages = torch.unique(loc // self.token_to_kv_pool.swa_page_size)
-        self._dsv4_debug_prev_pages = (kv_pages, swa_pages, int(tokens.numel()))
+        state_reqs = list(zip(forward_batch.req_pool_indices.tolist(), seq_lens.tolist()))
+        self._dsv4_debug_prev_pages = (kv_pages, swa_pages, int(tokens.numel()), state_reqs)
 
     def _build_forward_metadata(
         self,
