@@ -321,6 +321,33 @@ def _get_sm120_routed_moe_state(group):
     return state
 
 
+def _get_prefill_cp_size_or_one() -> int:
+    try:
+        from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+        from sglang.srt.runtime_context import get_parallel
+
+        if is_dsa_enable_prefill_cp():
+            return int(get_parallel().attn_cp_size)
+    except Exception:
+        return 1
+    return 1
+
+
+def _get_max_tokens_per_rank(global_num_tokens: list[int]) -> int:
+    """Largest per-rank token count behind the DP-synced counts.
+
+    Under DSA prefill CP one attention DP group spans all CP ranks, so the
+    DP-synced counts are whole-sequence counts while each CP rank holds only
+    its round-robin share; the collective launch must be sized to the largest
+    share, not to the whole sequence.
+    """
+    global_max = max(global_num_tokens)
+    cp_size = _get_prefill_cp_size_or_one()
+    if cp_size > 1:
+        global_max = -(-global_max // cp_size)
+    return global_max
+
+
 def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> int:
     if not config.use_dp_max_tokens:
         return num_tokens
@@ -331,14 +358,16 @@ def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> in
     ):
         if not global_num_tokens:
             raise RuntimeError("FlashInfer SM120 MegaMoE requires DP token counts")
-        bucket = max(global_num_tokens)
+        bucket = _get_max_tokens_per_rank(global_num_tokens)
         if num_tokens > bucket:
             raise ValueError("DP token bucket is smaller than local hidden states")
         return bucket
     if not global_num_tokens:
         effective_num_tokens = num_tokens
     else:
-        effective_num_tokens = max(max(global_num_tokens), num_tokens)
+        effective_num_tokens = max(
+            _get_max_tokens_per_rank(global_num_tokens), num_tokens
+        )
     if (
         0 < effective_num_tokens < config.pre_dispatch_group_size
         and _get_disaggregation_mode_or_none() == "prefill"

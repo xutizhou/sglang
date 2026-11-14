@@ -44,6 +44,67 @@ class TestMegaMoeArchValidation(CustomTestCase):
         self.assertEqual(config.name, "sm90_mxfp4")
         self.assertFalse(config.uses_sm120_routed_api)
 
+    def _sm120_routed_config(self):
+        fp4 = torch.empty(1, dtype=torch.int8)
+        with mock.patch.object(mega_moe, "_device_sm", 120):
+            return mega_moe._select_mega_moe_arch_config(fp4, fp4)
+
+    def _effective(self, config, local, global_counts, cp_size, flashinfer=False):
+        with (
+            mock.patch.object(
+                mega_moe,
+                "_get_dp_global_num_tokens_or_none",
+                return_value=global_counts,
+            ),
+            mock.patch.object(
+                mega_moe, "_get_prefill_cp_size_or_one", return_value=cp_size
+            ),
+            mock.patch.object(
+                mega_moe, "_sm120_flashinfer_enabled", return_value=flashinfer
+            ),
+            mock.patch.object(
+                mega_moe, "_get_disaggregation_mode_or_none", return_value=None
+            ),
+        ):
+            return mega_moe._get_effective_num_tokens(config, local)
+
+    def test_effective_tokens_use_the_cp_share_under_prefill_cp(self):
+        # DSA prefill CP4 with a 16K chunk: the DP-synced count is the whole
+        # chunk, each CP rank holds 4096 tokens. Sizing the launch to 16384
+        # broke the SM120 routed cap of 8192 tokens per rank.
+        config = self._sm120_routed_config()
+        self.assertEqual(self._effective(config, 4096, [16384], cp_size=4), 4096)
+        # Uneven round-robin shares: the launch covers the largest share.
+        self.assertEqual(self._effective(config, 4097, [16385], cp_size=4), 4097)
+        self.assertEqual(self._effective(config, 4096, [16385], cp_size=4), 4097)
+
+    def test_effective_tokens_without_cp_keep_the_dp_max(self):
+        config = self._sm120_routed_config()
+        self.assertEqual(self._effective(config, 3000, [6000, 3000], cp_size=1), 6000)
+        self.assertEqual(self._effective(config, 3000, None, cp_size=1), 3000)
+
+    def test_flashinfer_bucket_uses_the_cp_share_under_prefill_cp(self):
+        config = self._sm120_routed_config()
+        self.assertEqual(
+            self._effective(config, 2048, [8192], cp_size=4, flashinfer=True), 2048
+        )
+        self.assertEqual(
+            self._effective(config, 2048, [8192], cp_size=1, flashinfer=True), 8192
+        )
+        with self.assertRaises(ValueError):
+            self._effective(config, 2049, [8192], cp_size=4, flashinfer=True)
+
+    def test_prefill_cp_size_defaults_to_one_without_cp_state(self):
+        with mock.patch.dict(
+            sys.modules, {"sglang.srt.layers.attention.dsa.utils": None}
+        ):
+            self.assertEqual(mega_moe._get_prefill_cp_size_or_one(), 1)
+        fake_utils = SimpleNamespace(is_dsa_enable_prefill_cp=lambda: False)
+        with mock.patch.dict(
+            sys.modules, {"sglang.srt.layers.attention.dsa.utils": fake_utils}
+        ):
+            self.assertEqual(mega_moe._get_prefill_cp_size_or_one(), 1)
+
     def test_sm120_scale_layout_interleaves_gate_up(self):
         scales = (
             torch.arange(2 * 32, dtype=torch.float32)
