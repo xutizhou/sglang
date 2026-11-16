@@ -1677,6 +1677,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
+                from sglang.srt.layers.moe.flashinfer_moe_ep import (
+                    build_fi_moe_ep_experts_weights,
+                    fi_moe_ep_overlay_enabled,
+                )
+
+                if fi_moe_ep_overlay_enabled():
+                    # FlashInfer moe_ep for extend steps; also does the DeepGEMM scale packing for decode.
+                    assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm
+                    build_fi_moe_ep_experts_weights(layer)
+                    return
+
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 

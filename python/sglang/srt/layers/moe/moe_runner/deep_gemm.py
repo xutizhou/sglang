@@ -289,6 +289,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # The SM120 DeepGEMM contiguous GEMM consumes standard-layout
             # activations only; other architectures keep the swizzled layout.
             self.use_swizzle = not _is_sm120
+        from sglang.srt.layers.moe.flashinfer_moe_ep import fi_moe_ep_overlay_enabled
+
+        self._fi_moe_ep_overlay = fi_moe_ep_overlay_enabled()
+        if self._fi_moe_ep_overlay:
+            # w13 is stored gate/up 8-row interleaved (shared with FlashInfer moe_ep);
+            # the masked decode path reads it through the swizzle-aware SwiGLU.
+            assert (
+                self.use_fused_activation
+            ), "SGLANG_FI_MOE_EP needs SGLANG_OPT_USE_JIT_EP_ACTIVATION"
+            self.use_swizzle = True
 
     def run(
         self,
@@ -333,6 +343,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             create_per_token_group_quant_fp8_output_scale,
         )
 
+        if self._fi_moe_ep_overlay:
+            raise RuntimeError(
+                "SGLANG_FI_MOE_EP: the DeepGEMM contiguous (prefill) path must not run; "
+                "extend steps go to FlashInfer moe_ep"
+            )
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]

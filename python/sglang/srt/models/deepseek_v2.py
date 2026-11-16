@@ -900,6 +900,19 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
+        from sglang.srt.layers.moe.flashinfer_moe_ep import (
+            forward_fi_moe_ep,
+            should_use_fi_moe_ep,
+        )
+
+        if should_use_fi_moe_ep(self, forward_batch):
+            return forward_fi_moe_ep(
+                self,
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+            )
+
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
